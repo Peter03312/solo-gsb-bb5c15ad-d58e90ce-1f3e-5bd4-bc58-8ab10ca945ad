@@ -98,6 +98,16 @@ function assertDraft(pkg) {
   }
 }
 
+// 档期搜索只适用于单站包：多站巡展包必须明确拒绝
+function assertSingleStop(db, pkg) {
+  const n = db.prepare('SELECT COUNT(*) FROM package_stops WHERE package_id=?').pluck().get(pkg.id);
+  if (n >= 2) {
+    throw new ScheduleError(409,
+      '档期搜索只适用于单站展览包；多站巡展包请逐站编排行程（站次不同媒介/地区/展期，不支持整包统一档期搜索）。',
+      { code: 'MULTI_STOP_UNSUPPORTED', stopCount: n });
+  }
+}
+
 function packageInput(pkg, items) {
   const medium = str(pkg.medium).trim();
   const region = str(pkg.region).trim();
@@ -272,6 +282,7 @@ function searchSchedule(db, raw) {
   }
   const pkg = loadDraftPackage(db, packageId);
   assertDraft(pkg);
+  assertSingleStop(db, pkg);
   const items = db
     .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
     .all(packageId)
@@ -381,6 +392,7 @@ function applySchedule(db, raw) {
   const run = db.transaction(() => {
     const pkg = loadDraftPackage(db, packageId);
     assertDraft(pkg);
+    assertSingleStop(db, pkg);
 
     // 1) 令牌必须属于本包且结构完整
     const tokenPkg = Number(token.packageId);

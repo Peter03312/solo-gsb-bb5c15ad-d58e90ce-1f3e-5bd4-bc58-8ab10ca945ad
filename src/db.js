@@ -79,13 +79,39 @@ function initSchema(database) {
       updated_at   TEXT NOT NULL
     );
 
-    -- 包内素材清单（发布后冻结）
+    -- 包内素材清单（整包共享；发布后冻结）
     CREATE TABLE IF NOT EXISTS package_items (
       package_id  INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
       material_id INTEGER NOT NULL REFERENCES materials(id),
       position    INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(package_id, material_id)
     );
+
+    -- 多站巡展行程：仅多站包有行（≥2 行），单站包沿用 packages 顶层列、无行。
+    -- 站按 position 顺序展出；站间不得重叠（首尾日均占用，由应用层校验）。
+    CREATE TABLE IF NOT EXISTS package_stops (
+      id         INTEGER PRIMARY KEY,
+      package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
+      position   INTEGER NOT NULL,
+      name       TEXT NOT NULL,
+      medium     TEXT NOT NULL,
+      region     TEXT NOT NULL,
+      use_from   TEXT NOT NULL,
+      use_to     TEXT NOT NULL,
+      UNIQUE(package_id, position)
+    );
+
+    -- 行程冻结：非待发布包（已发布/需复核）的站次不可改、不可删
+    CREATE TRIGGER IF NOT EXISTS trg_stop_freeze_upd BEFORE UPDATE ON package_stops
+    BEGIN
+      SELECT RAISE(ABORT, 'itinerary is frozen: package is not a draft')
+      WHERE EXISTS (SELECT 1 FROM packages WHERE id = NEW.package_id AND status <> 'draft');
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_stop_freeze_del BEFORE DELETE ON package_stops
+    BEGIN
+      SELECT RAISE(ABORT, 'itinerary is frozen: package is not a draft')
+      WHERE EXISTS (SELECT 1 FROM packages WHERE id = OLD.package_id AND status <> 'draft');
+    END;
 
     -- 不可变核验快照：发布快照 + 自动复核快照 + 手动复核快照，只追加
     CREATE TABLE IF NOT EXISTS verification_snapshots (

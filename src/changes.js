@@ -17,7 +17,7 @@
 //   应用变更后重算影响并与预演清单比对；任一不符则整体回滚，无部分写入。
 //   通过后按现有规则执行变更、标记需复核并追加不可变快照。
 
-const { isValidDate, findPath, loadGraph, verifyPackage, revalidatePublished } = require('./verify');
+const { isValidDate, findPath, loadGraph, verifyStoredPackage, loadStops, revalidatePublished } = require('./verify');
 const { nowIso } = require('./db');
 
 class ChangeError extends Error {
@@ -221,50 +221,83 @@ function loadPublishedPackages(db) {
         .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
         .all(pkg.id)
         .map((r) => r.material_id);
-      return { pkg, items };
+      const stops = loadStops(db, pkg.id);
+      return { pkg, items, stops };
     });
 }
 
 function verifyEntry(db, entry) {
-  const { pkg, items } = entry;
-  return verifyPackage(db, {
-    materialIds: items,
-    medium: pkg.medium,
-    region: pkg.region,
-    useFrom: pkg.use_from,
-    useTo: pkg.use_to,
-  });
+  return verifyStoredPackage(db, entry.pkg, entry.items, entry.stops);
 }
 
-// 影响条目：仅“由合格变不合格”的已发布包 + 问题节点（变更后结果）与原因
+// 影响条目：仅“由合格变不合格”的已发布包 + 问题节点（变更后结果）与原因。
+// 多站包按站列出失格站及其问题节点（含全部来源路径）；单站包保持旧字段。
 function buildImpact(entries, beforeById, resultsAfter) {
   const impact = [];
   for (let i = 0; i < entries.length; i++) {
-    const { pkg } = entries[i];
+    const { pkg, stops } = entries[i];
     const before = beforeById.get(pkg.id);
     const after = resultsAfter[i];
     if (!before.eligible || after.eligible) continue;
-    impact.push({
-      packageId: pkg.id,
-      packageName: pkg.name,
-      medium: pkg.medium,
-      region: pkg.region,
-      useFrom: pkg.use_from,
-      useTo: pkg.use_to,
-      failingNodes: after.failingNodes,
-    });
+    if (after.multiStop) {
+      impact.push({
+        packageId: pkg.id,
+        packageName: pkg.name,
+        multiStop: true,
+        stopCount: after.stats.stopCount,
+        failingStops: after.stops
+          .filter((s) => !s.eligible)
+          .map((s) => ({
+            position: s.position,
+            name: s.name,
+            medium: s.medium,
+            region: s.region,
+            useFrom: s.useFrom,
+            useTo: s.useTo,
+            failingNodes: s.failingNodes,
+          })),
+        failingNodes: after.failingNodes,
+      });
+    } else {
+      impact.push({
+        packageId: pkg.id,
+        packageName: pkg.name,
+        multiStop: false,
+        medium: pkg.medium,
+        region: pkg.region,
+        useFrom: pkg.use_from,
+        useTo: pkg.use_to,
+        failingNodes: after.failingNodes,
+      });
+    }
   }
   return impact;
 }
 
-// 影响清单的规范化指纹：只含包 id 与问题节点/原因，排序保证确定性
+// 影响清单的规范化指纹：含包 id 与每站问题节点/原因，排序保证确定性
 function impactFingerprint(impact) {
-  const canon = (impact || []).map((e) => ({
-    packageId: e.packageId,
-    nodes: e.failingNodes
-      .map((n) => ({ materialId: n.materialId, reasons: [...n.reasons].sort() }))
-      .sort((a, b) => a.materialId - b.materialId),
-  })).sort((a, b) => a.packageId - b.packageId);
+  const canon = (impact || []).map((e) => {
+    if (e.multiStop) {
+      const stops = e.failingStops || [];
+      return {
+        packageId: e.packageId,
+        stops: stops
+          .map((s) => ({
+            position: s.position,
+            nodes: s.failingNodes
+              .map((n) => ({ materialId: n.materialId, reasons: [...n.reasons].sort() }))
+              .sort((a, b) => a.materialId - b.materialId),
+          }))
+          .sort((a, b) => a.position - b.position),
+      };
+    }
+    return {
+      packageId: e.packageId,
+      nodes: e.failingNodes
+        .map((n) => ({ materialId: n.materialId, reasons: [...n.reasons].sort() }))
+        .sort((a, b) => a.materialId - b.materialId),
+    };
+  }).sort((a, b) => a.packageId - b.packageId);
   return JSON.stringify(canon);
 }
 

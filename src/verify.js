@@ -307,6 +307,305 @@ function verifyPackage(db, input) {
   };
 }
 
+// ---------- 多站巡展核验 ----------
+// 整包共享同一份入展素材清单（及其全部来源链）；逐站用该站自己的
+// 名称/媒介/地区/起止日期核验：每个节点在每个站都必须有一份未撤销授权
+// 独自覆盖该站整段展期（不同站可用不同授权，同站不可拼接短授权）。
+
+const STOP_REASON_TEXT = {
+  cycle: '来源关系成环，无法完成核验',
+  depth: '来源链超过最大深度（100 层），疑似存在成环',
+  no_auth: '该站：该节点未登记任何授权',
+  revoked: '该站：该节点的授权均已撤销',
+  media: '该站：无覆盖该站展示媒介的有效授权',
+  region: '该站：无覆盖该站展示地区的有效授权',
+  media_region: '该站：无覆盖该站展示媒介与地区的有效授权',
+  date: '该站：无任何一份授权能独自覆盖该站整段展期（短授权不可拼接）',
+};
+
+function normalizeStop(raw, index) {
+  const s = raw && typeof raw === 'object' ? raw : {};
+  return {
+    index,
+    name: strTrim(s.name),
+    medium: strTrim(s.media ?? s.medium),
+    region: strTrim(s.region),
+    useFrom: typeof s.useFrom === 'string' ? s.useFrom.trim() : '',
+    useTo: typeof s.useTo === 'string' ? s.useTo.trim() : '',
+  };
+}
+
+function strTrim(v) {
+  return v === null || v === undefined ? '' : String(v).trim();
+}
+
+// 站次自身字段校验；返回该站错误信息数组
+function stopFieldErrors(st) {
+  const errors = [];
+  if (!st.name) errors.push(`第 ${st.index + 1} 站缺少站点名称`);
+  if (!st.medium) errors.push(`第 ${st.index + 1} 站「${st.name || '未命名'}」缺少展示媒介`);
+  if (!st.region) errors.push(`第 ${st.index + 1} 站「${st.name || '未命名'}」缺少展示地区`);
+  if (!isValidDate(st.useFrom)) {
+    errors.push(`第 ${st.index + 1} 站「${st.name || '未命名'}」起始日期不合法：${st.useFrom || '（空）'}（需为 YYYY-MM-DD）`);
+  }
+  if (!isValidDate(st.useTo)) {
+    errors.push(`第 ${st.index + 1} 站「${st.name || '未命名'}」截止日期不合法：${st.useTo || '（空）'}（需为 YYYY-MM-DD）`);
+  }
+  if (isValidDate(st.useFrom) && isValidDate(st.useTo) && st.useFrom > st.useTo) {
+    errors.push(`第 ${st.index + 1} 站「${st.name || '未命名'}」起止日期不合法：起始 ${st.useFrom} 晚于截止 ${st.useTo}`);
+  }
+  return errors;
+}
+
+// 站间不得重叠：按数组顺序展出，相邻站必须满足 前站.useTo < 后站.useFrom（首尾日均占用）
+function stopOverlapErrors(stops) {
+  const errors = [];
+  for (let i = 1; i < stops.length; i++) {
+    const prev = stops[i - 1];
+    const cur = stops[i];
+    if (isValidDate(prev.useFrom) && isValidDate(prev.useTo) && prev.useFrom <= prev.useTo
+      && isValidDate(cur.useFrom) && isValidDate(cur.useTo) && cur.useFrom <= cur.useTo
+      && cur.useFrom <= prev.useTo) {
+      errors.push(
+        `第 ${i} 站「${prev.name}」展期至 ${prev.useTo}，与第 ${i + 1} 站「${cur.name}」起始 ${cur.useFrom} 重叠` +
+        `（首尾日均占用，后一站须晚于 ${prev.useTo} 开始）`
+      );
+    }
+  }
+  return errors;
+}
+
+/**
+ * 多站巡展核验。
+ * input: { materialIds:[], stops:[{name, medium/media, region, useFrom, useTo}, ...] }
+ * 结果按站给出问题节点、原因与全部来源路径；整包合格当且仅当每一站均合格。
+ */
+function verifyMultiStop(db, input) {
+  const materialIds = [...new Set(input.materialIds || [])].sort((a, b) => a - b);
+  const rawStops = Array.isArray(input.stops) ? input.stops : null;
+
+  const globalErrors = [];
+  if (materialIds.length === 0) globalErrors.push('展览包未选取任何素材');
+  if (!rawStops) {
+    globalErrors.push('多站巡展请求缺少行程 stops（数组，至少 2 站；单站包请使用顶层 medium/region/useFrom/useTo 字段）');
+  } else if (rawStops.length < 2) {
+    globalErrors.push(`多站巡展行程至少需要 2 站（当前 ${rawStops.length} 站）；单站展请使用包顶层媒介/地区/日期字段`);
+  }
+  const stops = rawStops ? rawStops.map((s, i) => normalizeStop(s, i)) : [];
+
+  // 逐站字段错误
+  const stopErrors = stops.map((s) => stopFieldErrors(s));
+  const allStopFieldsValid = stops.length >= 2 && stopErrors.every((e) => e.length === 0);
+  if (stops.length >= 2) {
+    const overlapErrors = allStopFieldsValid ? stopOverlapErrors(stops) : [];
+    globalErrors.push(...overlapErrors);
+  }
+  for (let i = 0; i < stops.length; i++) {
+    for (const e of stopErrors[i]) globalErrors.push(e);
+  }
+
+  const stopsValid = stops.length >= 2 && allStopFieldsValid && stopOverlapErrors(stops).length === 0;
+
+  // 素材缺失
+  const matRows = db.prepare('SELECT id, title, kind FROM materials').all();
+  const matById = new Map(matRows.map((m) => [m.id, m]));
+  const itemErrors = [];
+  for (const id of materialIds) {
+    if (!matById.has(id)) itemErrors.push({ materialId: id, reason: 'missing', message: `素材 #${id} 不存在` });
+  }
+  const roots = materialIds.filter((id) => matById.has(id));
+
+  // 来源链只遍历一次：全部入展品 → 节点路径集合（各站共享同一来源结构）
+  const adj = loadGraph(db);
+  const nodePaths = new Map(); // materialId -> 路径（去重）
+  const nodeIsRoot = new Map();
+  const cyclicNodeIds = new Set();
+  let truncated = false;
+  let anyCycle = false;
+  let anyDepth = false;
+
+  for (const root of roots) {
+    nodeIsRoot.set(root, true);
+    const chains = collectChains(adj, root);
+    truncated = truncated || chains.truncated;
+    anyDepth = anyDepth || chains.tooDeep;
+    for (const id of chains.cyclicNodes) { anyCycle = true; cyclicNodeIds.add(id); }
+    for (const [id, paths] of chains.nodePaths) {
+      if (!nodePaths.has(id)) nodePaths.set(id, []);
+      const list = nodePaths.get(id);
+      for (const p of paths) {
+        const key = p.join('>');
+        if (!list.some((x) => x.join('>') === key)) list.push(p.slice());
+      }
+    }
+  }
+
+  const nodeIds = [...nodePaths.keys()].sort((a, b) => a - b);
+  const pathDTOs = new Map();
+  for (const id of nodeIds) {
+    const dtos = nodePaths.get(id)
+      .map((p) => p.map((pid) => ({
+        materialId: pid,
+        title: matById.get(pid) ? matById.get(pid).title : `#${pid}（已删除）`,
+      })))
+      .sort((a, b) => a.map((x) => x.materialId).join('>').localeCompare(b.map((x) => x.materialId).join('>')));
+    pathDTOs.set(id, dtos);
+  }
+
+  // 结构性原因（成环/超深）：对每个站都成立
+  const structuralReasons = new Map();
+  for (const id of nodeIds) {
+    const reasons = [];
+    if (cyclicNodeIds.has(id)) reasons.push('cycle');
+    if (anyDepth && nodePaths.get(id).some((p) => p.length > MAX_CHAIN_DEPTH)) reasons.push('depth');
+    structuralReasons.set(id, reasons);
+  }
+
+  const authRows = db.prepare('SELECT * FROM authorizations').all();
+  const authByMat = new Map();
+  for (const a of authRows) {
+    if (!authByMat.has(a.material_id)) authByMat.set(a.material_id, []);
+    authByMat.get(a.material_id).push(a);
+  }
+
+  // 逐站核验
+  const stopResults = stops.map((st) => {
+    const nodes = nodeIds.map((id) => {
+      const reasons = [...(structuralReasons.get(id) || [])];
+      let matchedAuthorization = null;
+      let candidates = [];
+      if (stopsValid && reasons.length === 0) {
+        const ev = evalNode(authByMat.get(id) || [], {
+          medium: st.medium, region: st.region, useFrom: st.useFrom, useTo: st.useTo,
+        });
+        if (ev.reason) reasons.push(ev.reason);
+        if (ev.matched) {
+          matchedAuthorization = {
+            id: ev.matched.id,
+            media: ev.matched.media,
+            region: ev.matched.region,
+            validFrom: ev.matched.valid_from,
+            validTo: ev.matched.valid_to,
+          };
+        }
+        candidates = ev.detail;
+      }
+      return {
+        materialId: id,
+        title: matById.get(id) ? matById.get(id).title : `#${id}（已删除）`,
+        kind: matById.get(id) ? matById.get(id).kind : null,
+        isRoot: nodeIsRoot.get(id) === true,
+        reasons,
+        eligible: reasons.length === 0,
+        matchedAuthorization,
+        candidates,
+      };
+    });
+    const failingNodes = nodes.filter((n) => !n.eligible).map((n) => ({
+      materialId: n.materialId,
+      title: n.title,
+      isRoot: n.isRoot,
+      reasons: n.reasons,
+      reasonText: n.reasons.map((r) => STOP_REASON_TEXT[r] || REASON_TEXT[r] || r),
+      paths: pathDTOs.get(n.materialId),
+    }));
+    return {
+      position: st.index,
+      name: st.name,
+      medium: st.medium,
+      region: st.region,
+      useFrom: st.useFrom,
+      useTo: st.useTo,
+      valid: stopErrors[st.index].length === 0,
+      errors: stopErrors[st.index],
+      eligible: stopErrors[st.index].length === 0 && failingNodes.length === 0,
+      stats: {
+        nodeCount: nodes.length,
+        failingCount: failingNodes.length,
+      },
+      failingNodes,
+      nodes,
+    };
+  });
+
+  if (truncated) {
+    globalErrors.push(`来源路径数量超过安全上限（${MAX_PATH_INSTANCES} 条路径实例），核验已截断；为避免漏判节点，本次按不通过处理。请简化来源结构后重试。`);
+  }
+  if (anyDepth) {
+    globalErrors.push(`来源链深度超过 ${MAX_CHAIN_DEPTH} 层（疑似存在成环），本次按不通过处理。`);
+  }
+
+  const totalFailing = stopResults.reduce((acc, s) => acc + s.stats.failingCount, 0);
+  const eligible = globalErrors.length === 0
+    && itemErrors.length === 0
+    && !anyCycle
+    && !anyDepth
+    && stopsValid
+    && totalFailing === 0;
+
+  return {
+    generatedAt: new Date().toISOString(),
+    basisVersion: basisVersion(db),
+    multiStop: true,
+    request: {
+      materialIds,
+      stops: stops.map((s) => ({ position: s.index, name: s.name, medium: s.medium, region: s.region, useFrom: s.useFrom, useTo: s.useTo })),
+    },
+    eligible,
+    globalErrors,
+    itemErrors,
+    stats: {
+      rootCount: roots.length,
+      nodeCount: nodeIds.length,
+      stopCount: stops.length,
+      failingStopCount: stopResults.filter((s) => !s.eligible).length,
+      failingNodeCountTotal: totalFailing,
+      pathCountTruncated: truncated,
+      cyclic: anyCycle,
+    },
+    stops: stopResults,
+    // 跨站汇总的问题节点（每个节点 × 每个失格站一条），便于旧界面/清单消费
+    failingNodes: stopResults.flatMap((s) => s.failingNodes.map((n) => ({
+      ...n,
+      stopPosition: s.position,
+      stopName: s.name,
+    }))),
+  };
+}
+
+// 读取已存储包（单站/多站）并按其形态核验。stops 由调用方/本函数从 package_stops 载入。
+function loadStops(db, packageId) {
+  return db.prepare('SELECT position, name, medium, region, use_from, use_to FROM package_stops WHERE package_id=? ORDER BY position')
+    .all(packageId)
+    .map((r) => ({
+      position: r.position,
+      name: r.name,
+      medium: r.medium,
+      region: r.region,
+      useFrom: r.use_from,
+      useTo: r.use_to,
+    }));
+}
+
+function verifyStoredPackage(db, pkg, items, stopsRows) {
+  const stops = stopsRows || loadStops(db, pkg.id);
+  if (stops.length >= 2) {
+    return verifyMultiStop(db, {
+      materialIds: items,
+      stops: stops.map((s) => ({
+        name: s.name, medium: s.medium, region: s.region, useFrom: s.useFrom ?? s.use_from, useTo: s.useTo ?? s.use_to,
+      })),
+    });
+  }
+  return verifyPackage(db, {
+    materialIds: items,
+    medium: pkg.medium,
+    region: pkg.region,
+    useFrom: pkg.use_from,
+    useTo: pkg.use_to,
+  });
+}
+
 // 授权/来源变更后：仅把“由合格变不合格”的已发布包标为需复核，追加 review 快照。
 function revalidatePublished(db) {
   const rows = db
@@ -318,13 +617,7 @@ function revalidatePublished(db) {
       .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
       .all(pkg.id)
       .map((r) => r.material_id);
-    const result = verifyPackage(db, {
-      materialIds: items,
-      medium: pkg.medium,
-      region: pkg.region,
-      useFrom: pkg.use_from,
-      useTo: pkg.use_to,
-    });
+    const result = verifyStoredPackage(db, pkg, items);
     if (pkg.status === 'published' && !result.eligible) {
       db.prepare("UPDATE packages SET status='needs_review', updated_at=? WHERE id=?")
         .run(new Date().toISOString(), pkg.id);
@@ -346,6 +639,13 @@ module.exports = {
   collectChains,
   basisVersion,
   verifyPackage,
+  verifyMultiStop,
+  verifyStoredPackage,
+  loadStops,
+  stopFieldErrors,
+  stopOverlapErrors,
+  normalizeStop,
   revalidatePublished,
   REASON_TEXT,
+  STOP_REASON_TEXT,
 };

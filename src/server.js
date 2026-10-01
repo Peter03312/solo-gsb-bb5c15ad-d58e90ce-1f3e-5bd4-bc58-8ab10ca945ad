@@ -8,6 +8,12 @@ const {
   findPath,
   loadGraph,
   verifyPackage,
+  verifyMultiStop,
+  verifyStoredPackage,
+  loadStops,
+  normalizeStop,
+  stopFieldErrors,
+  stopOverlapErrors,
   revalidatePublished,
 } = require('./verify');
 const { previewChange, commitChange, ChangeError } = require('./changes');
@@ -90,6 +96,10 @@ function packageDTO(p, full = false) {
         WHERE i.package_id=? ORDER BY i.position, i.material_id`
     )
     .all(p.id);
+  const stopRows = db
+    .prepare('SELECT position, name, medium, region, use_from AS useFrom, use_to AS useTo FROM package_stops WHERE package_id=? ORDER BY position')
+    .all(p.id);
+  const multiStop = stopRows.length >= 2;
   const latest = db
     .prepare('SELECT * FROM verification_snapshots WHERE package_id=? ORDER BY id DESC LIMIT 1')
     .get(p.id);
@@ -103,6 +113,9 @@ function packageDTO(p, full = false) {
     region: p.region,
     useFrom: p.use_from,
     useTo: p.use_to,
+    multiStop,
+    stopCount: stopRows.length,
+    stops: stopRows.map((s) => ({ ...s, position: s.position })),
     status: p.status,
     createdAt: p.created_at,
     publishedAt: p.published_at,
@@ -331,12 +344,52 @@ app.get('/api/packages/:id', (req, res, next) => {
 function readPackageBody(body) {
   const name = str(body.name).trim();
   if (!name) throw new HttpError(400, '展览包名称不能为空');
+  const materialIds = [...new Set((body.materialIds || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+
+  // 多站巡展：body.stops 为数组时按多站行程处理（至少 2 站；单站请走顶层字段）
+  if (body.stops !== undefined) {
+    if (!Array.isArray(body.stops)) {
+      throw new HttpError(400, 'stops 必须为数组（每站含 name/media/region/useFrom/useTo）', { code: 'INVALID_STOPS' });
+    }
+    if (body.stops.length === 0) {
+      throw new HttpError(400, '行程不能为空：多站巡展至少需要 2 站；单站展请勿传 stops', { code: 'INVALID_STOPS' });
+    }
+    if (body.stops.length === 1) {
+      throw new HttpError(400, '只有 1 站时请使用包顶层媒介/地区/起止日期字段（单站包不按多站行程存储）', { code: 'INVALID_STOPS' });
+    }
+    const stops = body.stops.map((s, i) => normalizeStop(s, i));
+    const fieldErrors = stops.flatMap((s) => stopFieldErrors(s));
+    if (fieldErrors.length) throw new HttpError(400, fieldErrors.join('；'), { code: 'INVALID_STOPS' });
+    const overlapErrors = stopOverlapErrors(stops);
+    if (overlapErrors.length) throw new HttpError(409, overlapErrors.join('；'), { code: 'STOPS_OVERLAP' });
+    // 顶层媒介/地区/展期取首站，供旧字段/列表展示兼容；包名仍以 body.name 为准
+    const first = stops[0];
+    return {
+      multiStop: true,
+      name,
+      medium: first.medium,
+      region: first.region,
+      useFrom: first.useFrom,
+      useTo: first.useTo,
+      materialIds,
+      stops,
+    };
+  }
+
   const { medium, region } = validateScope(body);
   const useFrom = str(body.useFrom).trim();
   const useTo = str(body.useTo).trim();
   validateDateRange(useFrom, useTo);
-  const materialIds = [...new Set((body.materialIds || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
-  return { name, medium, region, useFrom, useTo, materialIds };
+  return { name, medium, region, useFrom, useTo, materialIds, multiStop: false, stops: null };
+}
+
+// 多站行程落库（调用方须已开启事务且包为 draft）
+function replaceStops(packageId, stops) {
+  db.prepare('DELETE FROM package_stops WHERE package_id=?').run(packageId);
+  const ins = db.prepare(
+    'INSERT INTO package_stops(package_id, position, name, medium, region, use_from, use_to) VALUES (?,?,?,?,?,?,?)'
+  );
+  stops.forEach((s, i) => ins.run(packageId, i, s.name, s.medium, s.region, s.useFrom, s.useTo));
 }
 
 app.post('/api/packages', (req, res, next) => {
@@ -350,6 +403,7 @@ app.post('/api/packages', (req, res, next) => {
       b.materialIds.forEach((mid, i) => {
         db.prepare('INSERT INTO package_items(package_id, material_id, position) VALUES (?,?,?)').run(pid, mid, i);
       });
+      if (b.multiStop) replaceStops(pid, b.stops);
       return pid;
     });
     res.status(201).json(packageDTO(db.prepare('SELECT * FROM packages WHERE id=?').get(info), true));
@@ -364,6 +418,12 @@ app.patch('/api/packages/:id', (req, res, next) => {
     if (pkg.status !== 'draft') {
       throw new HttpError(409, `已发布/需复核包（状态 ${pkg.status}）的参数与清单不可修改；如需调整请复制为新的待发布包`);
     }
+    const wasMultiStop = db.prepare('SELECT COUNT(*) FROM package_stops WHERE package_id=?').pluck().get(id) >= 2;
+    if (wasMultiStop && req.body.stops === undefined) {
+      throw new HttpError(400,
+        '该包为多站巡展包，修改时必须在 stops 中提交完整行程（多站行程仅待发布时可改）；如需改为单站请新建单站包',
+        { code: 'STOPS_REQUIRED' });
+    }
     const b = readPackageBody(req.body);
     for (const mid of b.materialIds) loadMaterial(mid);
     tx(() => {
@@ -373,6 +433,8 @@ app.patch('/api/packages/:id', (req, res, next) => {
       b.materialIds.forEach((mid, i) => {
         db.prepare('INSERT INTO package_items(package_id, material_id, position) VALUES (?,?,?)').run(id, mid, i);
       });
+      if (b.multiStop) replaceStops(id, b.stops);
+      else db.prepare('DELETE FROM package_stops WHERE package_id=?').run(id);
     });
     res.json(packageDTO(db.prepare('SELECT * FROM packages WHERE id=?').get(id), true));
   } catch (e) { next(e); }
@@ -391,6 +453,10 @@ app.post('/api/packages/:id/copy', (req, res, next) => {
         db.prepare('INSERT OR IGNORE INTO package_items(package_id, material_id, position) VALUES (?,?,?)')
           .run(r.lastInsertRowid, it.material_id, it.position);
       });
+      // 多站行程随副本复制（副本为待发布，仍可继续编排）
+      db.prepare(
+        'INSERT INTO package_stops(package_id, position, name, medium, region, use_from, use_to) SELECT ?, position, name, medium, region, use_from, use_to FROM package_stops WHERE package_id=? ORDER BY position'
+      ).run(r.lastInsertRowid, id);
       return r.lastInsertRowid;
     });
     res.status(201).json(packageDTO(db.prepare('SELECT * FROM packages WHERE id=?').get(newId), true));
@@ -412,11 +478,26 @@ app.delete('/api/packages/:id', (req, res, next) => {
 app.post('/api/verify', (req, res, next) => {
   try {
     let materialIds;
+    let stops = null;
     if (req.body.packageId) {
       const pkg = db.prepare('SELECT * FROM packages WHERE id=?').get(Number(req.body.packageId));
       if (!pkg) throw new HttpError(404, '展览包不存在');
       materialIds = db.prepare('SELECT material_id FROM package_items WHERE package_id=?').all(pkg.id).map((r) => r.material_id);
+      const stopRows = loadStops(db, pkg.id);
+      if (stopRows.length >= 2) {
+        const result = verifyMultiStop(db, {
+          materialIds,
+          stops: stopRows.map((s) => ({ name: s.name, medium: s.medium, region: s.region, useFrom: s.useFrom, useTo: s.useTo })),
+        });
+        return res.json(result);
+      }
       req.body = { ...req.body, medium: pkg.medium, region: pkg.region, useFrom: pkg.use_from, useTo: pkg.use_to };
+    } else if (Array.isArray(req.body.stops)) {
+      // 即席多站核验（无需已保存包）
+      materialIds = req.body.materialIds || [];
+      stops = req.body.stops;
+      const result = verifyMultiStop(db, { materialIds, stops });
+      return res.json(result);
     } else {
       materialIds = req.body.materialIds || [];
     }
@@ -455,13 +536,8 @@ app.post('/api/packages/:id/publish', (req, res, next) => {
         .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
         .all(id)
         .map((r) => r.material_id);
-      const result = verifyPackage(db, {
-        materialIds: items,
-        medium: pkg.medium,
-        region: pkg.region,
-        useFrom: pkg.use_from,
-        useTo: pkg.use_to,
-      });
+      // 发布时在同一事务内重读行程、清单与授权依据：多站包逐站核验，任一站失败则整包不发布
+      const result = verifyStoredPackage(db, pkg, items);
       return { eligible: result.eligible, result };
     });
 
@@ -515,13 +591,8 @@ app.post('/api/packages/:id/recheck', (req, res, next) => {
         .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
         .all(id)
         .map((r) => r.material_id);
-      const result = verifyPackage(db, {
-        materialIds: items,
-        medium: pkg.medium,
-        region: pkg.region,
-        useFrom: pkg.use_from,
-        useTo: pkg.use_to,
-      });
+      // 人工复核：多站包须全站合格才恢复为已发布
+      const result = verifyStoredPackage(db, pkg, items);
       const snapRes = db.prepare(
         `INSERT INTO verification_snapshots(package_id, kind, basis_version, eligible, payload, created_at)
          VALUES (?,?,?,?,?,?)`

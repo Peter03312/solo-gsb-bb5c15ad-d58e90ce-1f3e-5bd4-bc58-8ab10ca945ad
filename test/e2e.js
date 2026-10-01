@@ -533,6 +533,255 @@ async function call(method, url, body) {
     ok(again.status === 409 && again.data.details.code === 'NOT_DRAFT', '发布后再搜索档期被拒');
   }
 
+  console.log('14) 多站巡展：逐站编排/核验、整包发布闸门、按站影响预演、冻结与兼容性')
+  await (async () => {    // 独立干净链：tRoot -> tSrc，root 全域授权，source 按站准备授权
+    const m1 = (await call('POST', '/api/materials', { title: '多站-成片', kind: 'video' })).data.id;
+    const m2 = (await call('POST', '/api/materials', { title: '多站-来源', kind: 'audio' })).data.id;
+    await call('POST', `/api/materials/${m1}/sources`, { sourceMaterialId: m2, relation: '配乐' });
+    await call('POST', `/api/materials/${m1}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', licensor: 'r',
+    });
+    // source：北京站授权（03 月，屏幕/大陆）、上海站授权（05 月，投影/香港）
+    await call('POST', `/api/materials/${m2}/authorizations`, {
+      media: '屏幕放映', region: '中国大陆', validFrom: '2026-03-01', validTo: '2026-03-31', licensor: 'bj',
+    });
+    const aSh = (await call('POST', `/api/materials/${m2}/authorizations`, {
+      media: '沉浸式投影', region: '中国香港', validFrom: '2026-05-01', validTo: '2026-05-31', licensor: 'hk',
+    })).data.id;
+
+    // 14.1 创建两站包（不同媒介/地区/日期，站间不重叠）
+    const r = await call('POST', '/api/packages', {
+      name: '多站巡展包', materialIds: [m1],
+      stops: [
+        { name: '北京首展', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' },
+        { name: '香港巡展', medium: '沉浸式投影', region: '中国香港', useFrom: '2026-05-01', useTo: '2026-05-20' },
+      ],
+    });
+    ok(r.status === 201, '多站包创建成功');
+    ok(r.data.multiStop === true && r.data.stopCount === 2 && r.data.stops.length === 2, 'DTO 标记 multiStop 且含 2 站');
+    ok(r.data.medium === '屏幕放映' && r.data.useFrom === '2026-03-01', '顶层兼容字段取首站');
+    ok(r.data.itemCount === 1 && r.data.items[0].id === m1, '整包共享同一份素材清单');
+    const pid = r.data.id;
+    global.multiPid = pid; global.multiSrc = m2; global.multiShAuth = aSh;
+
+    // 14.2 逐站核验：不同站用不同授权，各自整段被同一份覆盖 -> 全站合格
+    const v = await call('POST', '/api/verify', { packageId: pid });
+    ok(v.status === 200 && v.data.multiStop === true, '多站核验返回 multiStop 形态');
+    ok(v.data.eligible === true && v.data.stats.stopCount === 2, '两站均合格，整包合格');
+    const s0 = v.data.stops[0], s1 = v.data.stops[1];
+    ok(s0.eligible && s1.eligible && s0.nodes.find((n) => n.materialId === m2).matchedAuthorization.media === '屏幕放映'
+      && s1.nodes.find((n) => n.materialId === m2).matchedAuthorization.media === '沉浸式投影',
+      '两站分别命中各自的不同授权');
+
+    // 14.3 同站不可拼接短授权：北京站展期跨 03-01~04-10，无单份覆盖 -> 仅该站失格 date
+    await call('PATCH', `/api/packages/${pid}`, {
+      name: '多站巡展包', materialIds: [m1],
+      stops: [
+        { name: '北京首展', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-20', useTo: '2026-04-10' },
+        { name: '香港巡展', medium: '沉浸式投影', region: '中国香港', useFrom: '2026-05-01', useTo: '2026-05-20' },
+      ],
+    });
+    const v2 = await call('POST', '/api/verify', { packageId: pid });
+    ok(v2.data.eligible === false && v2.data.stats.failingStopCount === 1, '一站失格则整包不合格');
+    const badStop = v2.data.stops.find((s) => !s.eligible);
+    const badNode = badStop.failingNodes.find((n) => n.materialId === m2);
+    ok(badStop.name === '北京首展' && badNode && badNode.reasons.includes('date'),
+      '失格站点列出问题节点与 date 原因（短授权不可拼接）');
+    ok(badNode.paths.some((p) => p.map((x) => x.materialId).join() === `${m1},${m2}`),
+      '按站给出问题节点的全部来源路径 root->src');
+    ok(v2.data.stops[1].eligible, '另一站不受影响仍合格');
+    ok(v2.data.failingNodes.some((n) => n.stopPosition === 0 && n.materialId === m2 && n.stopName === '北京首展'),
+      '跨站汇总失败节点带站点位置/名称');
+
+    // 14.4 站间重叠（首尾日均占用）保存即拒 409 STOPS_OVERLAP
+    const ov = await call('PATCH', `/api/packages/${pid}`, {
+      name: '多站巡展包', materialIds: [m1],
+      stops: [
+        { name: '北京首展', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' },
+        { name: '香港巡展', medium: '沉浸式投影', region: '中国香港', useFrom: '2026-03-20', useTo: '2026-05-20' },
+      ],
+    });
+    ok(ov.status === 409 && ov.data.details.code === 'STOPS_OVERLAP', '同日衔接（首尾占用）判为重叠并拒绝');
+    const gap = await call('PATCH', `/api/packages/${pid}`, {
+      name: '多站巡展包', materialIds: [m1],
+      stops: [
+        { name: '北京首展', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' },
+        { name: '香港巡展', medium: '沉浸式投影', region: '中国香港', useFrom: '2026-03-21', useTo: '2026-05-20' },
+      ],
+    });
+    ok(gap.status === 200, '前一站止次日为下一站起（不重叠）可保存');
+
+    // 14.5 行程字段校验：空站/单站/缺字段/坏日期
+    const e1 = await call('POST', '/api/packages', { name: 'e', materialIds: [m1], stops: [] });
+    const e2 = await call('POST', '/api/packages', { name: 'e', materialIds: [m1], stops: [{ name: 'x', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' }] });
+    const e3 = await call('POST', '/api/packages', {
+      name: 'e', materialIds: [m1],
+      stops: [
+        { name: 'a', medium: '', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' },
+        { name: 'b', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-05-01', useTo: '2026-05-20' },
+      ],
+    });
+    ok(e1.status === 400 && e1.data.details.code === 'INVALID_STOPS', '空行程报 400 INVALID_STOPS');
+    ok(e2.status === 400, '只有 1 站的 stops 被明确拒绝（单站请用顶层字段）');
+    ok(e3.status === 400 && e3.data.error.includes('媒介'), '某站缺媒介报 400 并指出站次');
+
+    // 14.6 多站行程仅待发布时可改：PATCH 已保存多站包必须带 stops
+    const noStops = await call('PATCH', `/api/packages/${pid}`, {
+      name: '多站巡展包', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20', materialIds: [m1],
+    });
+    ok(noStops.status === 400 && noStops.data.details.code === 'STOPS_REQUIRED', '编辑多站包不带 stops 报 400 STOPS_REQUIRED');
+
+    // 14.7 档期搜索只适用于单站：多站请求明确拒绝
+    const sch = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-01-01', planTo: '2026-12-31' });
+    ok(sch.status === 409 && sch.data.details.code === 'MULTI_STOP_UNSUPPORTED', '多站包搜索档期被明确拒绝');
+    const schApply = await call('POST', `/api/packages/${pid}/schedule/apply`, {
+      useFrom: '2026-03-01', searchToken: { packageId: pid, basisVersion: 1, fingerprint: 'x', planFrom: '2026-01-01', planTo: '2026-12-31', durationDays: 1 },
+    });
+    ok(schApply.status === 409 && schApply.data.details.code === 'MULTI_STOP_UNSUPPORTED', '多站包档期改期也被拒绝');
+
+    // 14.8 任一站失败整包不发布（422，包仍 draft，留快照）
+    // 当前香港站 03-21~05-20 超出北京授权但香港授权覆盖到 05-31：两站重新核验
+    // 构造一站不合格：把北京站改成香港媒介（其授权不匹配北京的屏幕/大陆组合的日期之外场景）
+    // 直接用现成失格形态：北京展期改 06 月（屏幕/大陆无 06 月 source 授权）
+    await call('PATCH', `/api/packages/${pid}`, {
+      name: '多站巡展包', materialIds: [m1],
+      stops: [
+        { name: '北京首展', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-06-01', useTo: '2026-06-10' },
+        { name: '香港巡展', medium: '沉浸式投影', region: '中国香港', useFrom: '2026-05-01', useTo: '2026-05-20' },
+      ],
+    });
+    const state0 = await call('GET', '/api/state');
+    const pubBad = await call('POST', `/api/packages/${pid}/publish`, { basisVersion: state0.data.basisVersion });
+    ok(pubBad.status === 422, '一站失格时发布整包拒绝 422');
+    ok(pubBad.data.details.result.multiStop === true
+      && pubBad.data.details.result.stops.some((s) => !s.eligible), '422 附按站核验结果');
+    const stillDraft = (await call('GET', `/api/packages/${pid}`)).data;
+    ok(stillDraft.status === 'draft', '拒绝后包仍为待发布');
+    ok(stillDraft.snapshots.length === 1 && stillDraft.snapshots[0].eligible === false,
+      '失败发布同样追加不可变记录');
+
+    // 14.9 两站合格后发布：同一事务重读行程/清单/依据，冻结各站结果与清单
+    await call('PATCH', `/api/packages/${pid}`, {
+      name: '多站巡展包', materialIds: [m1],
+      stops: [
+        { name: '北京首展', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' },
+        { name: '香港巡展', medium: '沉浸式投影', region: '中国香港', useFrom: '2026-05-01', useTo: '2026-05-20' },
+      ],
+    });
+    const vOk = await call('POST', '/api/verify', { packageId: pid });
+    ok(vOk.data.eligible === true, '恢复为全站合格');
+    const pubOk = await call('POST', `/api/packages/${pid}/publish`, { basisVersion: vOk.data.basisVersion });
+    ok(pubOk.status === 201 && pubOk.data.package.status === 'published', '多站包发布成功');
+    const frozen = pubOk.data.result;
+    ok(frozen.multiStop && frozen.stops.length === 2 && frozen.request.stops[1].name === '香港巡展',
+      '发布快照冻结各站行程与结果');
+    global.multiSnap = pubOk.data.snapshotId;
+
+    // 14.10 发布后行程冻结：PATCH 拒绝；快照不可变
+    const patchFrozen = await call('PATCH', `/api/packages/${pid}`, {
+      name: '多站巡展包', materialIds: [m1],
+      stops: [
+        { name: '北京首展', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' },
+        { name: '香港巡展', medium: '沉浸式投影', region: '中国香港', useFrom: '2026-05-01', useTo: '2026-05-21' },
+      ],
+    });
+    ok(patchFrozen.status === 409, '发布后多站行程不可修改');
+
+    // 14.11 授权/来源变更按站预演影响：撤销香港站当前覆盖授权 -> 仅香港站失格
+    // （14.13 之前尚未补授权，香港站覆盖授权即创建时的 aSh）
+    const pv = await call('POST', '/api/changes/preview', { operation: 'authorization.revoke', authorizationId: aSh });
+    ok(pv.status === 200 && pv.data.mutated === false, '多站影响预演只读成功');
+    let hit = pv.data.impact.find((p) => p.packageId === pid);
+    if (!hit) {
+      // 若历史数据中已存在其它香港授权（例如重跑），找到当前真正覆盖香港站的授权再预演
+      const matsNow = (await call('GET', '/api/materials')).data;
+      const hkAuth = matsNow.find((m) => m.id === m2).authorizations
+        .find((a) => !a.revoked && a.media === '沉浸式投影' && a.region === '中国香港');
+      const pv2 = await call('POST', '/api/changes/preview', { operation: 'authorization.revoke', authorizationId: hkAuth.id });
+      global._pvHk = { preview: pv2.data, authId: hkAuth.id };
+      hit = pv2.data.impact.find((p) => p.packageId === pid);
+    } else {
+      global._pvHk = { preview: pv.data, authId: aSh };
+    }
+    ok(!!hit && hit.multiStop === true && hit.stopCount === 2, '预演影响按多站形态返回');
+    ok(hit.failingStops.length === 1 && hit.failingStops[0].name === '香港巡展',
+      '只列出因此失格的站点（香港），北京站不在其列');
+    const fnode = hit.failingStops[0].failingNodes.find((n) => n.materialId === m2);
+    ok(fnode && fnode.reasons.length > 0 && ['revoked', 'media', 'region', 'media_region'].includes(fnode.reasons[0])
+      && fnode.paths.some((p) => p.map((x) => x.materialId).join() === `${m1},${m2}`),
+      '失格站的问题节点、原因（撤销/媒介或地区不符）与全部来源路径齐备');
+
+    // 14.12 确认提交：包置需复核 + 追加不可变快照，原发布快照保留
+    const commit = await call('POST', '/api/changes/commit', {
+      operation: 'authorization.revoke', authorizationId: global._pvHk.authId,
+      basisVersion: global._pvHk.preview.basisVersion, impact: global._pvHk.preview.impact,
+    });
+    ok(commit.status === 200 && commit.data.mutated === true, '按站影响确认提交成功');
+    const nr = (await call('GET', `/api/packages/${pid}`)).data;
+    ok(nr.status === 'needs_review', '因此失格的多站包置为需复核');
+    const publishSnaps = nr.snapshots.filter((s) => s.kind === 'publish');
+    const lastPublish = publishSnaps[publishSnaps.length - 1];
+    ok(lastPublish && lastPublish.eligible === true
+       && nr.snapshots.some((s) => s.kind === 'review' && s.eligible === false),
+      '原发布快照保留，追加不可变 review 快照');
+
+    // 14.13 人工复核须全站合格：只补回北京（香港仍缺）不恢复；补齐香港后恢复
+    const rc1 = await call('POST', `/api/packages/${pid}/recheck`);
+    ok(rc1.data.restored === false && rc1.data.package.status === 'needs_review',
+      '仍有站点失格时人工复核不恢复');
+    ok(rc1.data.result.multiStop && rc1.data.result.stops.some((s) => !s.eligible),
+      '复核结果仍按站给出');
+    // 若 14.11 预演时已存在额外香港授权（幂等重跑场景），它已被撤销；补一条新的覆盖授权
+    await call('POST', `/api/materials/${m2}/authorizations`, {
+      media: '沉浸式投影', region: '中国香港', validFrom: '2026-04-01', validTo: '2026-06-30', licensor: 'hk-restored',
+    });
+    const rc2 = await call('POST', `/api/packages/${pid}/recheck`);
+    ok(rc2.data.restored === true && rc2.data.package.status === 'published'
+       && rc2.data.result.stops.every((s) => s.eligible),
+      '全站合格后人工复核恢复为已发布');
+
+    // 14.14 复制多站包：行程随副本复制为待发布，可继续编排
+    const cp = await call('POST', `/api/packages/${pid}/copy`);
+    ok(cp.status === 201 && cp.data.status === 'draft' && cp.data.multiStop === true
+       && cp.data.stops.length === 2 && cp.data.itemCount === 1,
+      '复制多站包保留全部站次与共享清单，且为待发布');
+    const patchCopy = await call('PATCH', `/api/packages/${cp.data.id}`, {
+      name: '多站巡展包（副本改）', materialIds: [m1],
+      stops: [
+        { name: '广州首展', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' },
+        { name: '成都巡展', medium: '沉浸式投影', region: '中国香港', useFrom: '2026-05-01', useTo: '2026-05-20' },
+        { name: '西安加场', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-07-01', useTo: '2026-07-10' },
+      ],
+    });
+    ok(patchCopy.status === 200 && patchCopy.data.stopCount === 3, '副本（待发布）可继续增改站次');
+
+    // 14.15 兼容性：既有单站包请求/响应形态不变（旧包视为单站）
+    const legacyList = await call('GET', '/api/packages');
+    const demoPkg = legacyList.data.find((p) => p.name.includes('常设展'));
+    ok(demoPkg && demoPkg.multiStop === false && demoPkg.stopCount === 0 && Array.isArray(demoPkg.stops) && demoPkg.stops.length === 0,
+      '既有单站包 DTO 字段保持兼容');
+    const lv = await call('POST', '/api/verify', { packageId: demoPkg.id });
+    ok(lv.data.multiStop === undefined && Array.isArray(lv.data.nodes) && !Array.isArray(lv.data.stops),
+      '单站核验响应保持旧形态（nodes/failingNodes，无 stops）');
+    // 即席单站核验字段不变
+    const lv2 = await call('POST', '/api/verify', {
+      materialIds: [m1], medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20',
+    });
+    ok(lv2.data.multiStop === undefined && lv2.data.eligible === true, '即席单站核验旧请求/旧响应兼容');
+
+    // 14.16 即席多站核验（无需先建包），路径/原因按站返回
+    const adhoc = await call('POST', '/api/verify', {
+      materialIds: [m1],
+      stops: [
+        { name: '即席站A', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' },
+        { name: '即席站B', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-09-01', useTo: '2026-09-10' },
+      ],
+    });
+    ok(adhoc.data.multiStop === true && adhoc.data.eligible === false
+       && adhoc.data.stops[0].eligible === true && adhoc.data.stops[1].eligible === false,
+      '即席多站核验按站判定，无覆盖的站失格');
+  })();
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });
