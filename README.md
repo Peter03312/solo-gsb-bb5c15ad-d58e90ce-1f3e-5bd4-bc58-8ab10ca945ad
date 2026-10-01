@@ -2,6 +2,8 @@
 
 供小型展馆在选取数字展品组成展览包时，沿**全部来源链**逐节点核验使用授权（媒介、地区、有效期、撤销状态），并在发布时**原子保存不可变的核验快照与素材清单**。授权随后变更时自动重算资格，仅把“由合格变不合格”的已发布包标记为**需复核**，原快照始终保留。
 
+自本轮起支持策展人为**待发布**展览包编排**多站巡展**：每站填写名称、展示媒介、地区与起止日期，按顺序展出、站间不得重叠（首尾日期均算占用），整包共享一份入展素材清单；核验**逐站**沿全部来源链检查，不同站可用不同授权、同一站不可拼接短授权，**任一站失败则整包不发布**。既有单站包的请求、响应与数据完全兼容，旧包一律视为单站。
+
 - 后端：Node.js 20 + Express + better-sqlite3（SQLite，同步事务）
 - 前端：原生 HTML/CSS/JS，无构建步骤
 - 交付：Dockerfile + docker-compose 一键启动，数据库自动初始化
@@ -50,7 +52,8 @@ npm start
 运行自检（需先启动服务）：
 
 ```bash
-node test/e2e.js
+node test/e2e.js        # 单站/既有业务规则（104 项）
+node test/e2e-tour.js   # 多站巡展业务规则（46 项）
 ```
 
 ---
@@ -64,15 +67,23 @@ node test/e2e.js
    - 维护来源关系：「本素材 使用了 ← 来源素材」。关系按边逐条核验，添加会成环的边将被拒绝并提示完整闭环。
    - 登记授权：媒介、地区、有效期（起止日期）、撤销状态、授权方。媒介或地区填 `*` 表示通配任意值；匹配忽略大小写；有效期按闭区间覆盖整段使用期（`valid_from <= 使用起始` 且 `valid_to >= 使用截止`），已撤销授权一律不计入。
 2. **展览包与核验发布**
-   - 新建待发布包：填展示媒介、地区、起止日期，勾选入展素材（系统会自动纳入其全部上游来源节点）。
-   - 点「核验」：沿每个入展品的**全部**来源路径遍历，逐节点检查是否至少有一份“未撤销 + 媒介命中 + 地区命中 + 覆盖整段使用期”的授权。结果列出：
-     - 全局错误（缺媒介/地区、日期不合法、起晚于止等）；
-     - 不合格节点及其原因（无授权 / 全部撤销 / 媒介不符 / 地区不符 / 日期不覆盖 / 成环）；
-     - 每个不合格节点的全部来源路径（入展品 → … → 问题节点）。
-   - 点「按此次核验结果原子发布」：
-     - 服务端在事务内**重新读取并重算**，并比对“核验依据版本”。若核验之后授权或来源关系被任何人修改过，返回 `409 STALE_BASIS`，拒绝发布并提示重新核验；
-     - 核验不通过（缺授权、日期不合法等）返回 `422`，包保持“待发布”，但本次尝试同样留存为不可变记录；
-     - 通过则在**单个 SQLite 事务**内写入不可变核验快照（完整逐节点结果 JSON + 冻结清单 + 依据版本）并置为“已发布”。
+   - 新建待发布包时可在「单站包 / 多站巡展包」间切换：
+     - **单站包**：填展示媒介、地区、起止日期（与旧版完全一致）。
+     - **多站巡展包**：逐站填写**站点名称、展示媒介、地区、起止日期**，按站次顺序展出；系统校验每站字段齐全、日期合法且起不晚于止，并保证**站间不得重叠**——后一站起始日必须**晚于**前一站截止日（首尾日期均算占用，首尾相接也算重叠）。
+   - 两种形态都勾选同一份入展素材清单（系统自动纳入全部上游来源节点）；多站行程与单/多形态**仅待发布时可改**，保存时整体替换。
+   - 点「核验」：多站包沿整包共享清单的**每个入展品全部来源路径**只遍历一次来源图，再**逐站**以该站媒介/地区/展期判定每个节点：
+     - **不同站可用不同授权**（如北京站用大陆授权、东京站用日本授权）；
+     - **同一站同一节点不可用多份短授权拼接**，必须有一份未撤销且媒介/地区命中的授权独自覆盖该站整段展期；
+     - 结果**按站**列出问题节点、原因（无授权 / 全部撤销 / 媒介不符 / 地区不符 / 日期不覆盖 / 成环）与该节点的**全部来源路径**；任一站有问题，整包即不可发布。
+   - 点「按此次核验结果原子发布」：服务端在**同一事务内重读行程、清单与全部授权依据**并重算全部站点，`basisVersion` 过期返回 `409 STALE_BASIS`，任一站不合格返回 `422`（包保持待发布，失败尝试同样留存为不可变记录）；通过则在单个 SQLite 事务内写入**各站逐节点结果 + 冻结清单 + 依据版本**的整包快照并置为“已发布”。
+   - **多站包不支持档期搜索**（该能力仅适用于单站包）：对多站包调用档期接口返回 `409 MULTI_STOP`；多站改期请直接编辑各站起止日期。
+   - **兼容性**：不带 `stops` 创建/编辑的请求与旧版完全等价；旧数据在 `package_stops` 表无行，一律视为单站（DTO 中 `kind:"single"`，多站为 `kind:"tour"`）。
+
+### 多站巡展的变更预演与人工复核
+
+- 授权或来源变更的「先预演、再确认」流程对多站包同样适用：预演结果中多站条目标记 `kind:"tour"`，并**按站**给出失格站点（`failingStops`）与展平的问题节点（`failingNodes` 中每项带 `stopPosition` / `stopName`、原因与全部来源路径）；影响指纹把站序号纳入比对。
+- 确认后仅把因此**由合格转不合格**的已发布多站包置为 `needs_review` 并追加不可变复核快照；原发布快照一行不改。
+- 人工复核（`POST /api/packages/:id/recheck`）对多站包要求**全站合格才恢复**为已发布；任一站点不合格则保持需复核。两种结果都会再追加一条快照。
 
 ### 授权变更后的行为（先预演、再确认）
 
@@ -123,7 +134,9 @@ node test/e2e.js
 | 授权命中 | 未撤销；媒介相等或授权媒介为 `*`；地区相等或授权地区为 `*`（忽略大小写） |
 | 日期覆盖 | `授权.valid_from ≤ 使用起始` 且 `授权.valid_to ≥ 使用截止`（闭区间） |
 | 节点合格 | 至少一份授权同时满足上述全部条件（单份授权必须独自覆盖整段使用期，不跨授权拼接） |
-| 发布闸门 | 无全局错误、无缺失素材、无环、无不合格节点，且依据版本未过期 |
+| 多站巡展 | 每站独立判定：不同站可用不同授权；同一站同一节点不可拼接短授权；**任一站不合格则整包不合格** |
+| 站间排期 | 站次按顺序展出，站间不得重叠（首尾日均算占用）：后一站起始日必须晚于前一站截止日 |
+| 发布闸门 | 无全局错误、无缺失素材、无环、无不合格节点（多站须全部站点通过），且依据版本未过期 |
 
 不可变性由数据库强制：`verification_snapshots` 表上配置了 `BEFORE UPDATE` / `BEFORE DELETE` 触发器，任何修改或删除都会被 SQLite 直接拒绝。
 
@@ -151,11 +164,11 @@ node test/e2e.js
 | `GET/POST /api/materials` · `PATCH/DELETE /api/materials/:id` | 素材 CRUD |
 | `POST /api/materials/:id/sources` · `DELETE /api/source-links/:id` | 来源关系（成环返回 409 + `cyclePath`/`cycle`） |
 | `POST /api/materials/:id/authorizations` · `PATCH /api/authorizations/:id` · `POST /api/authorizations/:id/revoke` · `DELETE` | 授权登记/修改/撤销/删除 |
-| `GET/POST /api/packages` · `PATCH/DELETE /api/packages/:id` · `POST /api/packages/:id/copy` | 展览包 |
-| `POST /api/verify` | 试核验（body 可传 `packageId` 或完整字段） |
-| `POST /api/packages/:id/schedule/search` | **档期搜索**（只读）：按包当前展期天数（含首尾）在规划窗口内查全部来源链节点均被同一份匹配授权完整覆盖的可用起始日，升序合并连续日 |
-| `POST /api/packages/:id/schedule/apply` | **选定档期改期**：body 携搜索返回的 `searchToken` 与 `useFrom`，事务内重验依据版本/包参数清单/状态/档期失效，任一不符拒绝且不改包 |
-| `POST /api/packages/:id/publish` | 发布，body 需含核验时的 `basisVersion`；过期 409、不合格 422 |
+| `GET/POST /api/packages` · `PATCH/DELETE /api/packages/:id` · `POST /api/packages/:id/copy` | 展览包（单站与多站：请求体带 `stops` 数组即为多站，至少 2 站；行程/形态仅待发布可改，复制保留行程） |
+| `POST /api/verify` | 试核验（body 可传 `packageId`，或传完整字段；多站传 `materialIds` + `stops`）。多站返回 `kind:"tour"` 与按站结果 `stops[]` |
+| `POST /api/packages/:id/schedule/search` | **档期搜索（仅单站）**：多站包调用返回 `409 MULTI_STOP`。单站按当前展期天数在规划窗口查全部来源链节点均被同一份匹配授权完整覆盖的可用起始日 |
+| `POST /api/packages/:id/schedule/apply` | **选定档期改期（仅单站）**：多站包同样 `409 MULTI_STOP`；单站事务内重验依据/参数清单/状态/档期失效 |
+| `POST /api/packages/:id/publish` | 发布，body 需含核验时的 `basisVersion`；多站在同一事务内重读行程/清单/授权，任一站失败整包不发布；过期 409、不合格 422 |
 | `POST /api/packages/:id/recheck` | 对需复核包人工重新核验 |
 | `POST /api/changes/preview` | **变更影响预演**（只读）：单笔授权增改撤删 / 单条来源增删，返回将由合格转不合格的已发布包、问题节点、原因与依据版本 |
 | `POST /api/changes/commit` | **确认提交同一操作 + 预演结果**：事务内核版本、重算并比对影响清单；过期/不一致/目标失效/非法均整体拒绝 |
@@ -263,6 +276,80 @@ curl -s -X POST http://localhost:3000/api/packages/12/schedule/apply \
 
 > 注意：应用成功后 `searchToken` 即作废（包展期已变），需要再次改期请重新搜索。
 
+### 多站巡展 API 调用示例
+
+第 1 步——创建（或 PATCH 编辑）待发布多站包：请求体带 `stops` 数组（至少 2 站），整包共享 `materialIds` 清单：
+
+```bash
+curl -s -X POST http://localhost:3000/api/packages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "巡展「城脉」京沪屏展包",
+    "stops": [
+      {"name":"北京站","media":"屏幕放映","region":"中国大陆","useFrom":"2026-03-01","useTo":"2026-04-15"},
+      {"name":"东京站","media":"屏幕放映","region":"日本东京","useFrom":"2026-05-01","useTo":"2026-05-31"}
+    ],
+    "materialIds": [1]
+  }'
+# → 201 { "id": 17, "kind":"tour", "stopCount":2,
+#         "stops":[ {"position":1,"name":"北京站", …}, {"position":2,…} ],
+#         "medium": null, "useFrom": null,
+#         "effectiveFrom":"2026-03-01", "effectiveTo":"2026-05-31", "status":"draft", … }
+```
+
+多站校验失败均为 `400 INVALID_STOPS`（`details.errors` 逐条列出）：
+
+```text
+400  少于 2 站 / 某站缺名称、媒介、地区 / 日期非法或起晚于止 / 站间重叠（后站起始不晚于前站截止）
+```
+
+第 2 步——按站核验（也可不保存直接试核验：body 传 `materialIds` + `stops`，不带 `packageId`）：
+
+```bash
+curl -s -X POST http://localhost:3000/api/verify \
+  -H 'Content-Type: application/json' -d '{"packageId":17}'
+# → { "kind":"tour", "eligible": false,
+#     "stats": { "stopCount":2, "failingStopCount":1, "failingCount":3, … },
+#     "stops": [
+#       { "position":1, "name":"北京站", "valid":true,  "failingNodes":[], "nodes":[ …逐节点 + matchedAuthorization… ] },
+#       { "position":2, "name":"东京站", "valid":false,
+#         "failingNodes":[
+#           { "stopPosition":2, "stopName":"东京站", "materialId":3, "title":"城市航拍素材",
+#             "reasons":["region"], "reasonText":["无覆盖该展示地区的有效授权"],
+#             "paths":[ [ {"materialId":1,…}, {"materialId":3,…} ] ] } ] } ],
+#     "failingStops":[ {"position":2, "name":"东京站", …} ],
+#     "failingNodes":[ …按站展平，每项带 stopPosition/stopName… ] }
+```
+
+第 3 步——发布（同一事务内重读行程、清单与授权依据；任一站失败整包不发布）：
+
+```bash
+curl -s -X POST http://localhost:3000/api/packages/17/publish \
+  -H 'Content-Type: application/json' -d '{"basisVersion":22}'
+# 全部站点合格 → 201：status=published，result.kind="tour"，
+#   不可变快照冻结各站逐节点结果（result.stops[].nodes）与整包清单（result.request.materialIds）
+# 任一站不合格 → 422（details.result 为 tour 结果；本次尝试留存不可变快照，包仍 draft）
+# 核验后授权/来源被改 → 409 STALE_BASIS
+```
+
+多站包对档期接口的调用会被明确拒绝：
+
+```bash
+curl -s -X POST http://localhost:3000/api/packages/17/schedule/search \
+  -H 'Content-Type: application/json' -d '{"planFrom":"2026-01-01","planTo":"2026-12-31"}'
+# → 409 { "details": { "code":"MULTI_STOP", "stopCount":2 } }
+```
+
+授权变更影响预演（`/api/changes/preview|commit`）会按站列出影响：多站条目中 `kind:"tour"`、
+`failingStops:[{position,name,…}]`、展平的 `failingNodes[].stopPosition/stopName`；确认提交后仅将
+因此失格的已发布多站包置为 `needs_review` 并追加快照。人工复核须**全站合格**才恢复：
+
+```bash
+curl -s -X POST http://localhost:3000/api/packages/17/recheck
+# → { "restored": true|false, "status":"published"|"needs_review",
+#     "result":{ "kind":"tour", "stops":[ …按站结果… ] }, … }   # 两种结果都追加一条 recheck 快照
+```
+
 ## 八、目录结构
 
 ```
@@ -272,15 +359,17 @@ curl -s -X POST http://localhost:3000/api/packages/12/schedule/apply \
 ├── docker-entrypoint.sh    # 可选演示数据初始化后启动
 ├── package.json
 ├── src
-│   ├── db.js               # SQLite 连接、建表、版本号/快照不可变触发器
-│   ├── verify.js           # 来源链遍历、成环检测、逐节点授权核验、发布后重算
-│   ├── schedule.js         # 档期规划：起始日可行区间折算/取交集/合并连续日、事务内重验改期
-│   ├── changes.js          # 单笔变更影响预演（回滚型事务模拟）与确认提交（事务内核版本/比对影响）
-│   ├── server.js           # Express API（发布事务、依据过期拒绝、/api/changes/preview|commit）
-│   └── seed.js             # 演示数据
-├── public                  # 浏览器前端（无构建）
+│   ├── db.js               # SQLite 连接、建表（含 package_stops 多站行程表）、版本号/快照不可变触发器
+│   ├── verify.js           # 来源链遍历、成环检测、单站 verifyPackage 与多站 verifyTourPackage、发布后重算
+│   ├── schedule.js         # 档期规划（仅单站；多站 409 MULTI_STOP）：区间折算/取交集/事务内重验改期
+│   ├── changes.js          # 单笔变更影响预演与确认提交（多站按站列影响，指纹含站序号）
+│   ├── server.js           # Express API（单站/多站包 CRUD、发布事务、/api/changes/preview|commit）
+│   └── seed.js             # 演示数据（单站 + 两站巡展：合格已发布包与有站失败的待发布包）
+├── public                  # 浏览器前端（无构建，含多站站次编辑器）
 │   ├── index.html
 │   ├── styles.css
 │   └── app.js
-└── test/e2e.js             # 端到端业务规则自检（104 项）
+└── test
+    ├── e2e.js             # 端到端业务规则自检（单站/既有，104 项）
+    └── e2e-tour.js        # 多站巡展端到端自检（46 项）
 ```

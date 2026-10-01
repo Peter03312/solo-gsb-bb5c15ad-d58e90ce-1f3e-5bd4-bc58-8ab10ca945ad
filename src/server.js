@@ -8,6 +8,10 @@ const {
   findPath,
   loadGraph,
   verifyPackage,
+  verifyTourPackage,
+  verifyStoredPackage,
+  normalizeStops,
+  loadStops,
   revalidatePublished,
 } = require('./verify');
 const { previewChange, commitChange, ChangeError } = require('./changes');
@@ -82,6 +86,18 @@ function authDTO(a) {
   };
 }
 
+function stopDTO(s) {
+  return {
+    id: s.id,
+    position: s.position,
+    name: s.name,
+    medium: s.medium,
+    region: s.region,
+    useFrom: s.use_from,
+    useTo: s.use_to,
+  };
+}
+
 function packageDTO(p, full = false) {
   const items = db
     .prepare(
@@ -90,19 +106,32 @@ function packageDTO(p, full = false) {
         WHERE i.package_id=? ORDER BY i.position, i.material_id`
     )
     .all(p.id);
+  const stops = db
+    .prepare('SELECT * FROM package_stops WHERE package_id=? ORDER BY position')
+    .all(p.id)
+    .map(stopDTO);
   const latest = db
     .prepare('SELECT * FROM verification_snapshots WHERE package_id=? ORDER BY id DESC LIMIT 1')
     .get(p.id);
   const publishSnap = db
     .prepare("SELECT * FROM verification_snapshots WHERE package_id=? AND kind='publish' ORDER BY id DESC LIMIT 1")
     .get(p.id);
+  // 多站包：packages 表上的单站字段为空，展期取首站起 → 末站止；旧包无 stops，视为单站
+  const isTour = stops.length > 0;
+  const effectiveFrom = isTour ? stops[0].useFrom : p.use_from;
+  const effectiveTo = isTour ? stops[stops.length - 1].useTo : p.use_to;
   const dto = {
     id: p.id,
     name: p.name,
+    kind: isTour ? 'tour' : 'single',
     medium: p.medium,
     region: p.region,
     useFrom: p.use_from,
     useTo: p.use_to,
+    stops,
+    stopCount: stops.length,
+    effectiveFrom,
+    effectiveTo,
     status: p.status,
     createdAt: p.created_at,
     publishedAt: p.published_at,
@@ -328,15 +357,51 @@ app.get('/api/packages/:id', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// 归一化包请求：单站沿用旧字段（media/medium、region、useFrom/useTo）；
+// 多站在 stops 数组中逐站填写名称、展示媒介、地区、起止日期，按数组顺序展出。
 function readPackageBody(body) {
   const name = str(body.name).trim();
   if (!name) throw new HttpError(400, '展览包名称不能为空');
+  const materialIds = [...new Set((body.materialIds || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+
+  const rawStops = Array.isArray(body.stops) ? body.stops : null;
+  if (rawStops) {
+    if (rawStops.length < 2) {
+      throw new HttpError(400, '多站巡展至少需要 2 个站次；单站包请使用单站字段（medium/region/useFrom/useTo）',
+        { code: 'INVALID_STOPS' });
+    }
+    const norm = normalizeStops(rawStops);
+    const errors = [];
+    if (norm.fatalError) errors.push(norm.fatalError);
+    for (const s of norm.stops) errors.push(...s.errors);
+    errors.push(...norm.orderErrors);
+    if (errors.length) throw new HttpError(400, '多站行程校验失败：' + errors.join('；'), { code: 'INVALID_STOPS', errors });
+    return {
+      name,
+      materialIds,
+      isTour: true,
+      stops: norm.stops.map((s) => ({
+        position: s.position, name: s.name, medium: s.medium, region: s.region, useFrom: s.useFrom, useTo: s.useTo,
+      })),
+    };
+  }
+
   const { medium, region } = validateScope(body);
   const useFrom = str(body.useFrom).trim();
   const useTo = str(body.useTo).trim();
   validateDateRange(useFrom, useTo);
-  const materialIds = [...new Set((body.materialIds || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
-  return { name, medium, region, useFrom, useTo, materialIds };
+  return { name, medium, region, useFrom, useTo, materialIds, isTour: false };
+}
+
+// 在事务内整体替换多站行程（多站行程仅待发布时可改）
+function replaceStops(packageId, stops) {
+  db.prepare('DELETE FROM package_stops WHERE package_id=?').run(packageId);
+  const ins = db.prepare(
+    'INSERT INTO package_stops(package_id, position, name, medium, region, use_from, use_to) VALUES (?,?,?,?,?,?,?)'
+  );
+  for (const s of stops) {
+    ins.run(packageId, s.position, s.name, s.medium, s.region, s.useFrom, s.useTo);
+  }
 }
 
 app.post('/api/packages', (req, res, next) => {
@@ -345,11 +410,19 @@ app.post('/api/packages', (req, res, next) => {
     for (const id of b.materialIds) loadMaterial(id);
     const info = tx(() => {
       const r = db.prepare('INSERT INTO packages(name, medium, region, use_from, use_to, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)')
-        .run(b.name, b.medium, b.region, b.useFrom, b.useTo, 'draft', nowIso(), nowIso());
+        .run(
+          b.name,
+          b.isTour ? null : b.medium,
+          b.isTour ? null : b.region,
+          b.isTour ? null : b.useFrom,
+          b.isTour ? null : b.useTo,
+          'draft', nowIso(), nowIso()
+        );
       const pid = r.lastInsertRowid;
       b.materialIds.forEach((mid, i) => {
         db.prepare('INSERT INTO package_items(package_id, material_id, position) VALUES (?,?,?)').run(pid, mid, i);
       });
+      if (b.isTour) replaceStops(pid, b.stops);
       return pid;
     });
     res.status(201).json(packageDTO(db.prepare('SELECT * FROM packages WHERE id=?').get(info), true));
@@ -368,7 +441,15 @@ app.patch('/api/packages/:id', (req, res, next) => {
     for (const mid of b.materialIds) loadMaterial(mid);
     tx(() => {
       db.prepare('UPDATE packages SET name=?, medium=?, region=?, use_from=?, use_to=?, updated_at=? WHERE id=?')
-        .run(b.name, b.medium, b.region, b.useFrom, b.useTo, nowIso(), id);
+        .run(
+          b.name,
+          b.isTour ? null : b.medium,
+          b.isTour ? null : b.region,
+          b.isTour ? null : b.useFrom,
+          b.isTour ? null : b.useTo,
+          nowIso(), id
+        );
+      replaceStops(id, b.isTour ? b.stops : []);
       db.prepare('DELETE FROM package_items WHERE package_id=?').run(id);
       b.materialIds.forEach((mid, i) => {
         db.prepare('INSERT INTO package_items(package_id, material_id, position) VALUES (?,?,?)').run(id, mid, i);
@@ -384,6 +465,7 @@ app.post('/api/packages/:id/copy', (req, res, next) => {
     const pkg = db.prepare('SELECT * FROM packages WHERE id=?').get(id);
     if (!pkg) throw new HttpError(404, '展览包不存在');
     const items = db.prepare('SELECT material_id, position FROM package_items WHERE package_id=? ORDER BY position').all(id);
+    const stops = loadStops(db, id);
     const newId = tx(() => {
       const r = db.prepare('INSERT INTO packages(name, medium, region, use_from, use_to, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)')
         .run(`${pkg.name}（副本）`, pkg.medium, pkg.region, pkg.use_from, pkg.use_to, 'draft', nowIso(), nowIso());
@@ -391,6 +473,14 @@ app.post('/api/packages/:id/copy', (req, res, next) => {
         db.prepare('INSERT OR IGNORE INTO package_items(package_id, material_id, position) VALUES (?,?,?)')
           .run(r.lastInsertRowid, it.material_id, it.position);
       });
+      if (stops.length) {
+        const ins = db.prepare(
+          'INSERT INTO package_stops(package_id, position, name, medium, region, use_from, use_to) VALUES (?,?,?,?,?,?,?)'
+        );
+        for (const s of stops) {
+          ins.run(r.lastInsertRowid, s.position, s.name, s.medium, s.region, s.useFrom, s.useTo);
+        }
+      }
       return r.lastInsertRowid;
     });
     res.status(201).json(packageDTO(db.prepare('SELECT * FROM packages WHERE id=?').get(newId), true));
@@ -412,21 +502,42 @@ app.delete('/api/packages/:id', (req, res, next) => {
 app.post('/api/verify', (req, res, next) => {
   try {
     let materialIds;
+    let stops = null;
     if (req.body.packageId) {
       const pkg = db.prepare('SELECT * FROM packages WHERE id=?').get(Number(req.body.packageId));
       if (!pkg) throw new HttpError(404, '展览包不存在');
       materialIds = db.prepare('SELECT material_id FROM package_items WHERE package_id=?').all(pkg.id).map((r) => r.material_id);
-      req.body = { ...req.body, medium: pkg.medium, region: pkg.region, useFrom: pkg.use_from, useTo: pkg.use_to };
+      const storedStops = loadStops(db, pkg.id);
+      if (storedStops.length) {
+        stops = storedStops;
+      } else {
+        req.body = { ...req.body, medium: pkg.medium, region: pkg.region, useFrom: pkg.use_from, useTo: pkg.use_to };
+      }
     } else {
       materialIds = req.body.materialIds || [];
+      if (Array.isArray(req.body.stops)) {
+        // 多站试核验：行程结构非法直接 400（与保存接口一致），核验结果仅在结果对象里反映授权类问题
+        const norm = normalizeStops(req.body.stops);
+        const errors = [];
+        if (norm.fatalError) errors.push(norm.fatalError);
+        if (!norm.fatalError && norm.stops.length < 2) errors.push('多站巡展至少需要 2 个站次');
+        for (const s of norm.stops) errors.push(...s.errors);
+        errors.push(...norm.orderErrors);
+        if (errors.length) {
+          throw new HttpError(400, '多站行程校验失败：' + errors.join('；'), { code: 'INVALID_STOPS', errors });
+        }
+        stops = norm.stops;
+      }
     }
-    const result = verifyPackage(db, {
-      materialIds,
-      medium: req.body.medium,
-      region: req.body.region,
-      useFrom: req.body.useFrom,
-      useTo: req.body.useTo,
-    });
+    const result = stops
+      ? verifyTourPackage(db, { materialIds, stops })
+      : verifyPackage(db, {
+        materialIds,
+        medium: req.body.medium,
+        region: req.body.region,
+        useFrom: req.body.useFrom,
+        useTo: req.body.useTo,
+      });
     res.json(result);
   } catch (e) { next(e); }
 });
@@ -455,13 +566,8 @@ app.post('/api/packages/:id/publish', (req, res, next) => {
         .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
         .all(id)
         .map((r) => r.material_id);
-      const result = verifyPackage(db, {
-        materialIds: items,
-        medium: pkg.medium,
-        region: pkg.region,
-        useFrom: pkg.use_from,
-        useTo: pkg.use_to,
-      });
+      // 同一事务内重读行程（多站）、清单与全部授权依据后重算：任一站失败则整包不合格
+      const result = verifyStoredPackage(db, pkg, items);
       return { eligible: result.eligible, result };
     });
 
@@ -515,13 +621,8 @@ app.post('/api/packages/:id/recheck', (req, res, next) => {
         .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
         .all(id)
         .map((r) => r.material_id);
-      const result = verifyPackage(db, {
-        materialIds: items,
-        medium: pkg.medium,
-        region: pkg.region,
-        useFrom: pkg.use_from,
-        useTo: pkg.use_to,
-      });
+      // 多站包人工复核须全站合格才恢复；单站包沿用原规则
+      const result = verifyStoredPackage(db, pkg, items);
       const snapRes = db.prepare(
         `INSERT INTO verification_snapshots(package_id, kind, basis_version, eligible, payload, created_at)
          VALUES (?,?,?,?,?,?)`

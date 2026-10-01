@@ -46,20 +46,33 @@
           <div class="form-row">
             <label>包名称<input name="name" required placeholder="例如：常设展屏幕展包" /></label>
           </div>
-          <div class="form-row four">
-            <label>展示媒介<input name="medium" required placeholder="屏幕放映（* 表示任意媒介）" /></label>
-            <label>展示地区<input name="region" required placeholder="中国大陆（* 表示任意地区）" /></label>
-            <label>起始日期<input name="useFrom" type="date" required /></label>
-            <label>截止日期<input name="useTo" type="date" required /></label>
+          <div class="form-row">
+            <div class="pkg-mode" role="radiogroup" aria-label="包形态">
+              <label><input type="radio" name="pkgMode" value="single" checked /> 单站包</label>
+              <label><input type="radio" name="pkgMode" value="tour" /> 多站巡展包（整包共享素材清单，按顺序逐站展出）</label>
+            </div>
+          </div>
+          <div class="form-row four" id="singleFields">
+            <label>展示媒介<input name="medium" placeholder="屏幕放映（* 表示任意媒介）" /></label>
+            <label>展示地区<input name="region" placeholder="中国大陆（* 表示任意地区）" /></label>
+            <label>起始日期<input name="useFrom" type="date" /></label>
+            <label>截止日期<input name="useTo" type="date" /></label>
+          </div>
+          <div class="form-row hidden" id="tourFields">
+            <div class="stops-head">
+              <span class="pick-label">巡展站次（按顺序展出，站间不得重叠，首尾日期均算占用）</span>
+              <button type="button" class="btn btn-small" id="addStopBtn">＋ 添加一站</button>
+            </div>
+            <div id="stopsEditor"></div>
           </div>
           <div class="form-row">
-            <label class="pick-label">选取素材（自动包含其全部来源链）</label>
+            <label class="pick-label">选取素材（自动包含其全部来源链；多站整包共享此清单）</label>
             <div id="materialPick" class="pick"></div>
           </div>
           <div class="form-row actions">
             <button type="submit" class="btn btn-primary" id="savePkgBtn">保存待发布包</button>
             <button type="button" class="btn" id="verifyPkgBtn">核验</button>
-            <button type="button" class="btn" id="scheduleFormBtn">搜索档期</button>
+            <button type="button" class="btn" id="scheduleFormBtn">搜索档期（仅单站）</button>
             <button type="button" class="btn" id="newPkgBtn">清空表单</button>
           </div>
         </form>

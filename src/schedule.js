@@ -13,7 +13,7 @@
 // 不满足长度的短授权折算为空——天然实现“同一节点短授权不可拼接”。
 
 const crypto = require('crypto');
-const { isValidDate, loadGraph, collectChains, basisVersion } = require('./verify');
+const { isValidDate, loadGraph, collectChains, basisVersion, loadStops } = require('./verify');
 
 class ScheduleError extends Error {
   constructor(status, message, details) {
@@ -95,6 +95,16 @@ function assertDraft(pkg) {
     throw new ScheduleError(409,
       `当前状态为 ${pkg.status}：已发布和需复核包不可改期；如需调整档期请使用「复制为待发布包」。`,
       { code: 'NOT_DRAFT', status: pkg.status });
+  }
+}
+
+// 档期搜索/选定仅适用于单站包；多站巡展请求须明确拒绝（多站行程按整包编辑）。
+function assertSingleStop(db, pkg) {
+  const stops = loadStops(db, pkg.id);
+  if (stops.length) {
+    throw new ScheduleError(409,
+      `该包为含 ${stops.length} 站的多站巡展包：档期搜索与选定改期仅适用于单站包；请直接编辑各站起止日期（站间不得重叠）。`,
+      { code: 'MULTI_STOP', stopCount: stops.length });
   }
 }
 
@@ -272,6 +282,7 @@ function searchSchedule(db, raw) {
   }
   const pkg = loadDraftPackage(db, packageId);
   assertDraft(pkg);
+  assertSingleStop(db, pkg);
   const items = db
     .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
     .all(packageId)
@@ -381,6 +392,7 @@ function applySchedule(db, raw) {
   const run = db.transaction(() => {
     const pkg = loadDraftPackage(db, packageId);
     assertDraft(pkg);
+    assertSingleStop(db, pkg);
 
     // 1) 令牌必须属于本包且结构完整
     const tokenPkg = Number(token.packageId);

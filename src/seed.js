@@ -41,6 +41,11 @@ function seed() {
     // 照片授权仅覆盖春季常设展期；秋季临时展（10–11 月）将因授权过期不合格
     insAuth.run(photo, '屏幕放映', '中国大陆', '2026-03-01', '2026-05-31', 0, '馆藏/家属授权', '仅春季展期', nowIso(), nowIso());
 
+    // 多站巡展海外站所需授权（与中国大陆授权互不替代：同站不可拼接，不同站各取一份）
+    insAuth.run(film, '屏幕放映', '日本东京', '2026-01-01', '2028-12-31', 0, '本馆摄制组', '巡展东京站', nowIso(), nowIso());
+    insAuth.run(footage, '屏幕放映', '日本东京', '2026-03-01', '2026-12-31', 0, '航拍图库', '巡展东京站', nowIso(), nowIso());
+    insAuth.run(photo, '屏幕放映', '日本东京', '2026-03-01', '2026-12-31', 0, '馆藏/家属授权', '巡展东京站', nowIso(), nowIso());
+
     // 一个已发布的合规包：春季展期内，film 全链 5 个节点均有覆盖授权
     const pkg1 = db
       .prepare("INSERT INTO packages(name, medium, region, use_from, use_to, status, published_at, created_at, updated_at) VALUES (?,?,?,?,?,'published',?,?,?)")
@@ -65,6 +70,53 @@ function seed() {
       .run('临时展屏展包（照片/字体授权过期）', '屏幕放映', '中国大陆', '2026-10-01', '2026-11-30', nowIso(), nowIso())
       .lastInsertRowid;
     db.prepare('INSERT INTO package_items(package_id, material_id, position) VALUES (?,?,?)').run(pkg2, film, 0);
+
+    // —— 多站巡展 ——
+    // 已发布的两站包：春季北京站 → 东京站，站间不重叠；两站来源链全部合格（不同站各用一份授权）。
+    const tourStops = [
+      { name: '北京春季站', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-04-15' },
+      { name: '东京春季站', medium: '屏幕放映', region: '日本东京', useFrom: '2026-05-01', useTo: '2026-05-31' },
+    ];
+    const pkgTour = db
+      .prepare("INSERT INTO packages(name, medium, region, use_from, use_to, status, published_at, created_at, updated_at) VALUES (?,NULL,NULL,NULL,NULL,'published',?,?,?)")
+      .run('巡展「城脉」京沪屏展包（北京/东京）', nowIso(), nowIso(), nowIso())
+      .lastInsertRowid;
+    db.prepare('INSERT INTO package_items(package_id, material_id, position) VALUES (?,?,?)').run(pkgTour, film, 0);
+    tourStops.forEach((s, i) => {
+      db.prepare(
+        'INSERT INTO package_stops(package_id, position, name, medium, region, use_from, use_to) VALUES (?,?,?,?,?,?,?)'
+      ).run(pkgTour, i + 1, s.name, s.medium, s.region, s.useFrom, s.useTo);
+    });
+    const rTour = require('./verify').verifyStoredPackage(
+      db,
+      db.prepare('SELECT * FROM packages WHERE id=?').get(pkgTour),
+      [film]
+    );
+    if (!rTour.eligible) {
+      throw new Error('演示数据自检失败：多站巡展包核验不合格：' + JSON.stringify(rTour.stops.map((s) => ({
+        p: s.position, fail: s.failingNodes.map((n) => ({ id: n.materialId, reasons: n.reasons })),
+      }))));
+    }
+    db.prepare(
+      `INSERT INTO verification_snapshots(package_id, kind, basis_version, eligible, payload, created_at)
+       VALUES (?,?,?,?,?,?)`
+    ).run(pkgTour, 'publish', rTour.basisVersion, 1, JSON.stringify(rTour), nowIso());
+
+    // 待发布多站包：北京春季站合格；巴黎站没有任何覆盖地区的授权（该站失败，整包不可发布）。
+    const tourDraftStops = [
+      { name: '北京站', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-10', useTo: '2026-03-31' },
+      { name: '巴黎站', medium: '屏幕放映', region: '法国巴黎', useFrom: '2026-04-10', useTo: '2026-05-10' },
+    ];
+    const pkgTourDraft = db
+      .prepare("INSERT INTO packages(name, medium, region, use_from, use_to, status, created_at, updated_at) VALUES (?,NULL,NULL,NULL,NULL,'draft',?,?)")
+      .run('巡展「城脉」欧亚屏展包（北京/巴黎，巴黎站缺授权）', nowIso(), nowIso())
+      .lastInsertRowid;
+    db.prepare('INSERT INTO package_items(package_id, material_id, position) VALUES (?,?,?)').run(pkgTourDraft, film, 0);
+    tourDraftStops.forEach((s, i) => {
+      db.prepare(
+        'INSERT INTO package_stops(package_id, position, name, medium, region, use_from, use_to) VALUES (?,?,?,?,?,?,?)'
+      ).run(pkgTourDraft, i + 1, s.name, s.medium, s.region, s.useFrom, s.useTo);
+    });
   });
 
   console.log('演示数据已写入。');

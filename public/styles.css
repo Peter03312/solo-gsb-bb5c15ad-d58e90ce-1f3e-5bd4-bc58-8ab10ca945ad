@@ -126,3 +126,22 @@ pre.json { background: #0f172a; color: #dbeafe; padding: 12px; border-radius: 8p
 .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #1f2430; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13.5px; z-index: 100; max-width: 80vw; }
 .toast.err { background: #9b1c14; }
 .small-muted { font-size: 12px; color: #8791a0; }
+
+/* ---------- 多站巡展 ---------- */
+.pkg-mode { display: flex; gap: 18px; font-size: 14px; padding: 6px 0; }
+.pkg-mode label { display: inline-flex; align-items: center; gap: 6px; }
+.stops-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 10px; flex-wrap: wrap; }
+.stop-row { display: grid; grid-template-columns: 64px 1.2fr 1fr 1fr 132px 132px 34px; gap: 6px; align-items: center; margin-bottom: 6px; }
+.stop-no { font-size: 12.5px; color: #46505c; font-weight: 600; }
+.stop-row input { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #d4d9e0; border-radius: 6px; font-size: 13px; }
+.stops-summary { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.stop-result { border: 1px solid #e2e5ea; border-radius: 8px; padding: 8px 12px; margin: 8px 0; background: #fbfcfe; }
+.stop-result.stop-ok { border-color: #bfe3cc; background: #f4faf6; }
+.stop-result.stop-bad { border-color: #f0c4bf; background: #fef6f5; }
+.stop-result h4 { margin: 0 0 6px; font-size: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+@media (max-width: 760px) {
+  .stop-row { grid-template-columns: 1fr 1fr; }
+  .stop-no { grid-column: 1 / -1; }
+  .stop-row input { grid-column: auto; }
+  .stop-row button { grid-column: 1 / -1; }
+}

@@ -142,29 +142,60 @@ function basisVersion(db) {
   return Number(db.prepare("SELECT value FROM meta WHERE key='basis_version'").pluck().get());
 }
 
-/**
- * 核验一个展览包候选（或已发布包）。
- * input: { materialIds:[], medium, region, useFrom, useTo }
- * 返回完整结果对象，可直接作为不可变快照 payload。
- */
-function verifyPackage(db, input) {
-  const materialIds = [...new Set(input.materialIds || [])].sort((a, b) => a - b);
-  const medium = (input.medium || '').trim();
-  const region = (input.region || '').trim();
-  const useFrom = input.useFrom || '';
-  const useTo = input.useTo || '';
+const str = (v) => (v === null || v === undefined ? '' : String(v));
 
-  const globalErrors = [];
-  if (materialIds.length === 0) globalErrors.push('展览包未选取任何素材');
-  if (!medium) globalErrors.push('缺少展示媒介');
-  if (!region) globalErrors.push('缺少展示地区');
-  if (!isValidDate(useFrom)) globalErrors.push(`起始日期不合法：${useFrom || '（空）'}（需为 YYYY-MM-DD）`);
-  if (!isValidDate(useTo)) globalErrors.push(`截止日期不合法：${useTo || '（空）'}（需为 YYYY-MM-DD）`);
-  if (isValidDate(useFrom) && isValidDate(useTo) && useFrom > useTo) {
-    globalErrors.push(`起止日期不合法：起始 ${useFrom} 晚于截止 ${useTo}`);
+// ---------- 多站巡展行程归一化与校验 ----------
+// 规则：每站名称/媒介/地区非空、日期合法且起不晚于止；按 position 顺序展出，
+// 站间不得重叠——首尾日期均算占用，后一站起始日必须晚于前一站截止日。
+function normalizeStops(rawStops) {
+  if (!Array.isArray(rawStops)) {
+    return { stops: [], fatalError: '多站巡展行程必须为站次数组' };
   }
-  const datesValid = isValidDate(useFrom) && isValidDate(useTo) && useFrom <= useTo;
+  const stops = rawStops.map((raw, idx) => {
+    const s = raw && typeof raw === 'object' ? raw : {};
+    const position = idx + 1;
+    const name = str(s.name).trim();
+    const medium = str(s.media ?? s.medium).trim();
+    const region = str(s.region).trim();
+    const useFrom = str(s.useFrom).trim();
+    const useTo = str(s.useTo).trim();
+    const label = name ? `第 ${position} 站「${name}」` : `第 ${position} 站（未命名）`;
+    const errors = [];
+    if (!name) errors.push(`第 ${position} 站：缺少站点名称`);
+    if (!medium) errors.push(`${label}：缺少展示媒介`);
+    if (!region) errors.push(`${label}：缺少展示地区`);
+    if (!isValidDate(useFrom)) errors.push(`${label}：起始日期不合法：${useFrom || '（空）'}（需为 YYYY-MM-DD）`);
+    if (!isValidDate(useTo)) errors.push(`${label}：截止日期不合法：${useTo || '（空）'}（需为 YYYY-MM-DD）`);
+    if (isValidDate(useFrom) && isValidDate(useTo) && useFrom > useTo) {
+      errors.push(`${label}：起止日期不合法：起始 ${useFrom} 晚于截止 ${useTo}`);
+    }
+    return { position, name, medium, region, useFrom, useTo, errors };
+  });
 
+  const orderErrors = [];
+  for (let i = 1; i < stops.length; i++) {
+    const prev = stops[i - 1];
+    const cur = stops[i];
+    const prevOk = isValidDate(prev.useFrom) && isValidDate(prev.useTo) && prev.useFrom <= prev.useTo;
+    const curOk = isValidDate(cur.useFrom) && isValidDate(cur.useTo) && cur.useFrom <= cur.useTo;
+    if (prevOk && curOk && cur.useFrom <= prev.useTo) {
+      orderErrors.push(
+        `第 ${cur.position} 站起始 ${cur.useFrom} 不晚于第 ${prev.position} 站截止 ${prev.useTo}：按顺序展出时站间不得重叠（首尾日期均算占用），后一站起始日须晚于前一站截止日`
+      );
+    }
+  }
+  return { stops, orderErrors, fatalError: null };
+}
+
+// 读取整包共享行程（按展出顺序）；无行即为单站包（含全部旧包）。
+function loadStops(db, packageId) {
+  return db
+    .prepare('SELECT position, name, medium, region, use_from AS useFrom, use_to AS useTo FROM package_stops WHERE package_id=? ORDER BY position')
+    .all(packageId);
+}
+
+// 入展品 roots 相同（整包共享清单），来源图只需构建一次，多站复用以各自媒介/地区/展期逐节点判定。
+function buildGraph(db, materialIds) {
   const matRows = db.prepare('SELECT id, title, kind FROM materials').all();
   const matById = new Map(matRows.map((m) => [m.id, m]));
 
@@ -182,9 +213,9 @@ function verifyPackage(db, input) {
     authByMat.get(a.material_id).push(a);
   }
 
-  const nodes = new Map(); // id -> aggregated node
-  let truncated = false;
-
+  const nodes = new Map();
+  const cycleIds = new Set();
+  const depthIds = new Set();
   const ensureNode = (id, isRoot) => {
     if (!nodes.has(id)) {
       const m = matById.get(id);
@@ -195,9 +226,6 @@ function verifyPackage(db, input) {
         isRoot,
         rootOf: [],
         paths: [],
-        reasons: [],
-        matchedAuthorization: null,
-        candidates: [],
       });
     }
     const n = nodes.get(id);
@@ -205,6 +233,7 @@ function verifyPackage(db, input) {
     return n;
   };
 
+  let truncated = false;
   let anyCycle = false;
   let anyDepth = false;
 
@@ -213,7 +242,7 @@ function verifyPackage(db, input) {
     const { nodePaths, cyclicNodes, truncated: t, tooDeep } = collectChains(adj, root);
     truncated = truncated || t;
     anyDepth = anyDepth || tooDeep;
-    for (const id of cyclicNodes) anyCycle = true;
+    for (const id of cyclicNodes) { anyCycle = true; cycleIds.add(id); }
 
     for (const [id, paths] of nodePaths) {
       const node = ensureNode(id, id === root);
@@ -227,47 +256,131 @@ function verifyPackage(db, input) {
           })));
         }
       }
-      if (cyclicNodes.has(id) && !node.reasons.includes('cycle')) node.reasons.push('cycle');
-      if (tooDeep && paths.some((p) => p.length > MAX_CHAIN_DEPTH) && !node.reasons.includes('depth')) {
-        node.reasons.push('depth');
-      }
-    }
-  }
-
-  for (const node of nodes.values()) {
-    node.paths.sort((a, b) => a.map((x) => x.materialId).join('>').localeCompare(b.map((x) => x.materialId).join('>')));
-    if (datesValid && !node.reasons.length) {
-      const ev = evalNode(authByMat.get(node.materialId) || [], { medium, region, useFrom, useTo });
-      if (ev.reason) node.reasons.push(ev.reason);
-      if (ev.matched) {
-        node.matchedAuthorization = {
-          id: ev.matched.id,
-          media: ev.matched.media,
-          region: ev.matched.region,
-          validFrom: ev.matched.valid_from,
-          validTo: ev.matched.valid_to,
-        };
-      }
-      node.candidates = ev.detail;
+      if (cyclicNodes.has(id)) cycleIds.add(id);
+      if (tooDeep && paths.some((p) => p.length > MAX_CHAIN_DEPTH)) depthIds.add(id);
     }
   }
 
   const nodeList = [...nodes.values()].sort((a, b) => a.materialId - b.materialId);
-  const failingNodes = nodeList.filter((n) => n.reasons.length > 0);
+  for (const node of nodeList) {
+    node.paths.sort((a, b) => a.map((x) => x.materialId).join('>').localeCompare(b.map((x) => x.materialId).join('>')));
+  }
 
-  // 保护上限触发时不能“可能漏判却放行”：按不合格处理并提示简化来源结构后重试
-  if (truncated) {
+  return {
+    matById,
+    authByMat,
+    itemErrors,
+    roots,
+    nodeList,
+    cycleIds,
+    depthIds,
+    truncated,
+    anyCycle,
+    anyDepth,
+  };
+}
+
+// 以某一站（或单站包）的媒介/地区/展期，对来源图上每个节点逐节点判定。
+// 不同站可使用不同授权；同一节点必须由一份授权独自覆盖整段展期，不跨授权拼接。
+function evaluateNodes(graph, scope) {
+  const useFrom = scope.useFrom || '';
+  const useTo = scope.useTo || '';
+  const datesValid = isValidDate(useFrom) && isValidDate(useTo) && useFrom <= useTo;
+  const byId = new Map();
+  for (const node of graph.nodeList) {
+    const reasons = [];
+    if (graph.cycleIds.has(node.materialId)) reasons.push('cycle');
+    if (graph.depthIds.has(node.materialId)) reasons.push('depth');
+    let matched = null;
+    let candidates = [];
+    if (datesValid && reasons.length === 0) {
+      const ev = evalNode(graph.authByMat.get(node.materialId) || [], {
+        medium: scope.medium, region: scope.region, useFrom, useTo,
+      });
+      if (ev.reason) reasons.push(ev.reason);
+      if (ev.matched) matched = ev.matched;
+      candidates = ev.detail;
+    }
+    byId.set(node.materialId, { reasons, matched, candidates });
+  }
+  return { datesValid, byId };
+}
+
+function matchedAuthDTO(a) {
+  return a ? {
+    id: a.id,
+    media: a.media,
+    region: a.region,
+    validFrom: a.valid_from,
+    validTo: a.valid_to,
+  } : null;
+}
+
+function fullNodeDTO(node, r) {
+  return {
+    materialId: node.materialId,
+    title: node.title,
+    kind: node.kind,
+    isRoot: node.isRoot,
+    reasons: r.reasons,
+    reasonText: r.reasons.map((x) => REASON_TEXT[x] || x),
+    eligible: r.reasons.length === 0,
+    paths: node.paths,
+    matchedAuthorization: matchedAuthDTO(r.matched),
+    candidates: r.candidates,
+  };
+}
+
+/**
+ * 核验单站展览包候选（或已发布包）。
+ * input: { materialIds:[], medium, region, useFrom, useTo }
+ * 返回完整结果对象，可直接作为不可变快照 payload（旧格式，保持兼容）。
+ */
+function verifyPackage(db, input) {
+  const materialIds = [...new Set(input.materialIds || [])].map(Number).sort((a, b) => a - b);
+  const medium = (input.medium || '').trim();
+  const region = (input.region || '').trim();
+  const useFrom = input.useFrom || '';
+  const useTo = input.useTo || '';
+
+  const globalErrors = [];
+  if (materialIds.length === 0) globalErrors.push('展览包未选取任何素材');
+  if (!medium) globalErrors.push('缺少展示媒介');
+  if (!region) globalErrors.push('缺少展示地区');
+  if (!isValidDate(useFrom)) globalErrors.push(`起始日期不合法：${useFrom || '（空）'}（需为 YYYY-MM-DD）`);
+  if (!isValidDate(useTo)) globalErrors.push(`截止日期不合法：${useTo || '（空）'}（需为 YYYY-MM-DD）`);
+  if (isValidDate(useFrom) && isValidDate(useTo) && useFrom > useTo) {
+    globalErrors.push(`起止日期不合法：起始 ${useFrom} 晚于截止 ${useTo}`);
+  }
+
+  const graph = buildGraph(db, materialIds);
+  const evaluated = evaluateNodes(graph, { medium, region, useFrom, useTo });
+
+  const nodesAll = graph.nodeList.map((node) => {
+    const r = evaluated.byId.get(node.materialId);
+    return fullNodeDTO(node, r);
+  });
+  const failingNodes = nodesAll.filter((n) => n.reasons.length > 0).map((n) => ({
+    materialId: n.materialId,
+    title: n.title,
+    isRoot: n.isRoot,
+    reasons: n.reasons,
+    reasonText: n.reasonText,
+    paths: n.paths,
+  }));
+
+  if (graph.truncated) {
     globalErrors.push(`来源路径数量超过安全上限（${MAX_PATH_INSTANCES} 条路径实例），核验已截断；为避免漏判节点，本次按不通过处理。请简化来源结构后重试。`);
   }
-  if (anyDepth) {
+  if (graph.anyDepth) {
     globalErrors.push(`来源链深度超过 ${MAX_CHAIN_DEPTH} 层（疑似存在成环），本次按不通过处理。`);
   }
 
   const eligible =
     globalErrors.length === 0 &&
-    itemErrors.length === 0 &&
-    !anyCycle &&
-    !anyDepth &&
+    graph.itemErrors.length === 0 &&
+    !graph.anyCycle &&
+    !graph.anyDepth &&
     failingNodes.length === 0;
 
   return {
@@ -276,35 +389,142 @@ function verifyPackage(db, input) {
     request: { materialIds, medium, region, useFrom, useTo },
     eligible,
     globalErrors,
-    itemErrors,
+    itemErrors: graph.itemErrors,
     stats: {
-      rootCount: roots.length,
-      nodeCount: nodeList.length,
+      rootCount: graph.roots.length,
+      nodeCount: nodesAll.length,
       failingCount: failingNodes.length,
-      pathCountTruncated: truncated,
-      cyclic: anyCycle,
+      pathCountTruncated: graph.truncated,
+      cyclic: graph.anyCycle,
     },
-    failingNodes: failingNodes.map((n) => ({
-      materialId: n.materialId,
-      title: n.title,
-      isRoot: n.isRoot,
-      reasons: n.reasons,
-      reasonText: n.reasons.map((r) => REASON_TEXT[r] || r),
-      paths: n.paths,
-    })),
-    nodes: nodeList.map((n) => ({
-      materialId: n.materialId,
-      title: n.title,
-      kind: n.kind,
-      isRoot: n.isRoot,
-      reasons: n.reasons,
-      reasonText: n.reasons.map((r) => REASON_TEXT[r] || r),
-      eligible: n.reasons.length === 0,
-      paths: n.paths,
-      matchedAuthorization: n.matchedAuthorization,
-      candidates: n.candidates,
-    })),
+    failingNodes,
+    nodes: nodesAll,
   };
+}
+
+/**
+ * 核验多站巡展包：整包共享一份素材清单，来源图只遍历一次，
+ * 逐站以该站媒介/地区/展期检查每个来源链节点——
+ * 不同站可用不同授权，同一站同一节点不可用多份短授权拼接。
+ * input: { materialIds:[], stops: [{ name, medium/media, region, useFrom, useTo }, ...] }
+ * 结果按站列出问题节点、原因与全部来源路径，可直接作为不可变快照 payload。
+ */
+function verifyTourPackage(db, input) {
+  const materialIds = [...new Set(input.materialIds || [])].map(Number).sort((a, b) => a - b);
+  const norm = normalizeStops(input.stops);
+  const stops = norm.stops;
+
+  const globalErrors = [];
+  if (norm.fatalError) globalErrors.push(norm.fatalError);
+  if (materialIds.length === 0) globalErrors.push('展览包未选取任何素材');
+  for (const s of stops) for (const e of s.errors) globalErrors.push(e);
+  for (const e of norm.orderErrors) globalErrors.push(e);
+
+  const graph = buildGraph(db, materialIds);
+
+  const stopResults = stops.map((s) => {
+    let nodes = [];
+    let failingNodes = [];
+    if (s.errors.length === 0) {
+      const evaluated = evaluateNodes(graph, {
+        medium: s.medium, region: s.region, useFrom: s.useFrom, useTo: s.useTo,
+      });
+      nodes = graph.nodeList.map((node) => fullNodeDTO(node, evaluated.byId.get(node.materialId)));
+      failingNodes = nodes.filter((n) => n.reasons.length > 0).map((n) => ({
+        stopPosition: s.position,
+        stopName: s.name,
+        materialId: n.materialId,
+        title: n.title,
+        isRoot: n.isRoot,
+        reasons: n.reasons,
+        reasonText: n.reasonText,
+        paths: n.paths,
+      }));
+    }
+    return {
+      position: s.position,
+      name: s.name,
+      medium: s.medium,
+      region: s.region,
+      useFrom: s.useFrom,
+      useTo: s.useTo,
+      errors: s.errors,
+      valid: s.errors.length === 0 && failingNodes.length === 0,
+      nodeCount: nodes.length,
+      failingCount: failingNodes.length,
+      failingNodes,
+      nodes,
+    };
+  });
+
+  if (graph.truncated) {
+    globalErrors.push(`来源路径数量超过安全上限（${MAX_PATH_INSTANCES} 条路径实例），核验已截断；为避免漏判节点，本次按不通过处理。请简化来源结构后重试。`);
+  }
+  if (graph.anyDepth) {
+    globalErrors.push(`来源链深度超过 ${MAX_CHAIN_DEPTH} 层（疑似存在成环），本次按不通过处理。`);
+  }
+
+  const failingStops = stopResults.filter((s) => !s.valid);
+  const failingNodes = stopResults.flatMap((s) => s.failingNodes);
+
+  const eligible =
+    globalErrors.length === 0 &&
+    graph.itemErrors.length === 0 &&
+    !graph.anyCycle &&
+    !graph.anyDepth &&
+    stops.length > 0 &&
+    failingStops.length === 0;
+
+  return {
+    generatedAt: new Date().toISOString(),
+    basisVersion: basisVersion(db),
+    kind: 'tour',
+    request: {
+      materialIds,
+      stops: stops.map((s) => ({
+        position: s.position, name: s.name, medium: s.medium, region: s.region, useFrom: s.useFrom, useTo: s.useTo,
+      })),
+    },
+    eligible,
+    globalErrors,
+    itemErrors: graph.itemErrors,
+    stats: {
+      rootCount: graph.roots.length,
+      nodeCount: graph.nodeList.length,
+      stopCount: stops.length,
+      failingStopCount: failingStops.length,
+      failingCount: failingNodes.length,
+      pathCountTruncated: graph.truncated,
+      cyclic: graph.anyCycle,
+    },
+    stops: stopResults,
+    failingStops: failingStops.map((s) => ({
+      position: s.position,
+      name: s.name,
+      medium: s.medium,
+      region: s.region,
+      useFrom: s.useFrom,
+      useTo: s.useTo,
+      errors: s.errors,
+      failingCount: s.failingCount,
+    })),
+    failingNodes,
+  };
+}
+
+// 按包实际形态（package_stops 是否有行）选择单站/多站核验。
+function verifyStoredPackage(db, pkg, items) {
+  const stops = loadStops(db, pkg.id);
+  if (stops.length) {
+    return verifyTourPackage(db, { materialIds: items, stops });
+  }
+  return verifyPackage(db, {
+    materialIds: items,
+    medium: pkg.medium,
+    region: pkg.region,
+    useFrom: pkg.use_from,
+    useTo: pkg.use_to,
+  });
 }
 
 // 授权/来源变更后：仅把“由合格变不合格”的已发布包标为需复核，追加 review 快照。
@@ -318,13 +538,7 @@ function revalidatePublished(db) {
       .prepare('SELECT material_id FROM package_items WHERE package_id=? ORDER BY position, material_id')
       .all(pkg.id)
       .map((r) => r.material_id);
-    const result = verifyPackage(db, {
-      materialIds: items,
-      medium: pkg.medium,
-      region: pkg.region,
-      useFrom: pkg.use_from,
-      useTo: pkg.use_to,
-    });
+    const result = verifyStoredPackage(db, pkg, items);
     if (pkg.status === 'published' && !result.eligible) {
       db.prepare("UPDATE packages SET status='needs_review', updated_at=? WHERE id=?")
         .run(new Date().toISOString(), pkg.id);
@@ -345,7 +559,11 @@ module.exports = {
   findPath,
   collectChains,
   basisVersion,
+  normalizeStops,
+  loadStops,
   verifyPackage,
+  verifyTourPackage,
+  verifyStoredPackage,
   revalidatePublished,
   REASON_TEXT,
 };

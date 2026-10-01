@@ -300,21 +300,92 @@ function renderMaterialPick() {
       ${esc(m.title)} <span class="small-muted">#${m.id}</span></label>`).join('');
 }
 
+// ---- 多站巡展站次编辑器 ----
+function emptyStop() {
+  return { name: '', media: '', region: '', useFrom: '', useTo: '' };
+}
+
+function renderStopsEditor(stops) {
+  const list = stops && stops.length ? stops : [emptyStop(), emptyStop()];
+  const box = $('#stopsEditor');
+  box.innerHTML = list.map((s, i) => `
+    <div class="stop-row" data-idx="${i}">
+      <div class="stop-no">第 ${i + 1} 站</div>
+      <input name="stopName" placeholder="站点名称（必填）" value="${esc(s.name || '')}" />
+      <input name="stopMedia" placeholder="展示媒介（* 任意）" value="${esc(s.media || '')}" />
+      <input name="stopRegion" placeholder="地区（* 任意）" value="${esc(s.region || '')}" />
+      <input name="stopFrom" type="date" value="${s.useFrom || ''}" title="起始日期" />
+      <input name="stopTo" type="date" value="${s.useTo || ''}" title="截止日期" />
+      <button type="button" class="btn btn-small btn-danger" data-act="remove-stop" title="删除该站">×</button>
+    </div>`).join('');
+}
+
+function readStopsEditor() {
+  return $$('#stopsEditor .stop-row').map((row) => ({
+    name: row.stopName.value.trim(),
+    media: row.stopMedia.value.trim(),
+    region: row.stopRegion.value.trim(),
+    useFrom: row.stopFrom.value,
+    useTo: row.stopTo.value,
+  }));
+}
+
+function pkgMode() {
+  return (document.querySelector('input[name="pkgMode"]:checked') || {}).value || 'single';
+}
+
+function setPkgMode(mode) {
+  const radio = document.querySelector(`input[name="pkgMode"][value="${mode}"]`);
+  if (radio) radio.checked = true;
+  $('#singleFields').classList.toggle('hidden', mode === 'tour');
+  $('#tourFields').classList.toggle('hidden', mode !== 'tour');
+  // 单站字段仅在单站模式必填
+  $$('#singleFields input').forEach((inp) => { inp.required = (mode === 'single'); });
+  $('#scheduleFormBtn').textContent = mode === 'tour' ? '多站包不支持档期搜索' : '搜索档期（仅单站）';
+}
+
+$$('input[name="pkgMode"]').forEach((r) => r.addEventListener('change', () => {
+  const mode = pkgMode();
+  setPkgMode(mode);
+  if (mode === 'tour' && !$$('#stopsEditor .stop-row').length) renderStopsEditor([emptyStop(), emptyStop()]);
+}));
+$('#addStopBtn').addEventListener('click', () => {
+  const stops = readStopsEditor();
+  stops.push(emptyStop());
+  renderStopsEditor(stops);
+});
+$('#stopsEditor').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-act="remove-stop"]');
+  if (!btn) return;
+  const stops = readStopsEditor();
+  const idx = Number(btn.closest('.stop-row').dataset.idx);
+  stops.splice(idx, 1);
+  renderStopsEditor(stops.length ? stops : [emptyStop(), emptyStop()]);
+});
+
 function readPkgForm() {
   const f = $('#packageForm');
-  return {
+  const base = {
     packageId: f.packageId.value ? Number(f.packageId.value) : null,
     name: f.name.value.trim(),
+    materialIds: $$('#materialPick input:checked').map((i) => Number(i.value)),
+  };
+  if (pkgMode() === 'tour') {
+    return { ...base, isTour: true, stops: readStopsEditor() };
+  }
+  return {
+    ...base,
+    isTour: false,
     medium: f.medium.value.trim(),
     region: f.region.value.trim(),
     useFrom: f.useFrom.value,
     useTo: f.useTo.value,
-    materialIds: $$('#materialPick input:checked').map((i) => Number(i.value)),
   };
 }
 
 function fillPkgForm(pkg) {
   const f = $('#packageForm');
+  const isTour = !!pkg.isTour || (pkg.kind === 'tour') || ((pkg.stops || []).length > 0);
   f.packageId.value = pkg.id || '';
   f.name.value = pkg.name || '';
   f.medium.value = pkg.medium || '';
@@ -324,6 +395,8 @@ function fillPkgForm(pkg) {
   renderMaterialPick();
   const ids = new Set((pkg.items || pkg.materialIds || []).map((x) => typeof x === 'object' ? x.id : x));
   $$('#materialPick input').forEach((i) => { i.checked = ids.has(Number(i.value)); });
+  setPkgMode(isTour ? 'tour' : 'single');
+  renderStopsEditor(isTour ? (pkg.stops || []) : [emptyStop(), emptyStop()]);
   $('#pkgFormTitle').textContent = pkg.id ? `编辑待发布包 #${pkg.id}` : '新建待发布展览包';
   $('#savePkgBtn').textContent = pkg.id ? '保存修改' : '保存待发布包';
   $('#verifyPanel').classList.add('hidden');
@@ -352,9 +425,14 @@ $('#packageForm').addEventListener('submit', async (e) => {
 $('#verifyPkgBtn').addEventListener('click', async () => {
   const b = readPkgForm();
   try {
-    const body = b.packageId
-      ? { packageId: b.packageId }
-      : { materialIds: b.materialIds, medium: b.medium, region: b.region, useFrom: b.useFrom, useTo: b.useTo };
+    let body;
+    if (b.packageId) {
+      body = { packageId: b.packageId };
+    } else if (b.isTour) {
+      body = { materialIds: b.materialIds, stops: b.stops };
+    } else {
+      body = { materialIds: b.materialIds, medium: b.medium, region: b.region, useFrom: b.useFrom, useTo: b.useTo };
+    }
     const result = await api('POST', '/api/verify', body);
     renderVerify(result, b);
   } catch (err) { toast(errText(err), true); }
@@ -365,41 +443,76 @@ function pathHtml(pathArr) {
     (i ? ' → ' : '') + `<span>${esc(n.title)}</span>`).join('') + '</div>';
 }
 
+function failingNodeCard(n) {
+  const stopTag = n.stopPosition
+    ? `<span class="pill pill-neutral">第 ${n.stopPosition} 站${n.stopName ? `·${esc(n.stopName)}` : ''}</span> `
+    : '';
+  return `
+    <div class="card" style="margin-bottom:8px">
+      <h3>${stopTag}<span class="fail-node">${esc(n.title)}</span> <span class="small-muted">#${n.materialId}${n.isRoot ? '（入展品）' : ''}</span></h3>
+      <div>${n.reasonText.map((t) => `<span class="pill pill-bad">${esc(t)}</span>`).join(' ')}</div>
+      <div class="section-title">不合格来源路径（共 ${n.paths.length} 条）</div>
+      ${n.paths.map((p) => '<div class="path">' + p.map((x, i) =>
+        (i ? ' → ' : '') + `<span class="${x.materialId === n.materialId ? 'fail-node' : ''}">${esc(x.title)}</span>`).join('') + '</div>').join('')}
+    </div>`;
+}
+
 function renderVerify(result, formData, mode = 'publish') {
   // mode: 'publish'（待发布包，可发布）| 'recheck'（已发布/需复核包，只能人工复核）
+  const isTour = result.kind === 'tour';
   const panel = $('#verifyPanel');
   panel.classList.remove('hidden');
   const globalErrs = (result.globalErrors || []).map((m) => `<div class="errorline">${esc(m)}</div>`).join('');
   const itemErrs = (result.itemErrors || []).map((x) => `<div class="errorline">${esc(x.message)}</div>`).join('');
-  const fail = (result.failingNodes || []).map((n) => `
-    <div class="card" style="margin-bottom:8px">
-      <h3><span class="fail-node">${esc(n.title)}</span> <span class="small-muted">#${n.materialId}${n.isRoot ? '（入展品）' : ''}</span></h3>
-      <div>${n.reasonText.map((t) => `<span class="pill pill-bad">${esc(t)}</span>`).join(' ')}</div>
-      <div class="section-title">不合格来源路径（共 ${n.paths.length} 条${result.stats.pathCountTruncated ? '，过多已截断' : ''}）</div>
-      ${n.paths.map((p) => '<div class="path">' + p.map((x, i) =>
-        (i ? ' → ' : '') + `<span class="${x.materialId === n.materialId ? 'fail-node' : ''}">${esc(x.title)}</span>`).join('') + '</div>').join('')}
-    </div>`).join('');
+
+  let detail = '';
+  if (isTour) {
+    detail = (result.stops || []).map((s) => `
+      <div class="stop-result ${s.valid ? 'stop-ok' : 'stop-bad'}">
+        <h4>
+          <span class="pill ${s.valid ? 'pill-ok' : 'pill-bad'}">${s.valid ? '本站合格' : '本站不合格'}</span>
+          第 ${s.position} 站 · ${esc(s.name)}
+          <span class="small-muted">${esc(s.medium)} ｜ ${esc(s.region)} ｜ ${s.useFrom} → ${s.useTo}</span>
+        </h4>
+        ${s.errors.length ? s.errors.map((m) => `<div class="errorline">${esc(m)}</div>`).join('') : ''}
+        ${s.failingNodes.length ? s.failingNodes.map((n) => failingNodeCard(n)).join('')
+          : (s.errors.length ? '' : '<div class="small-muted">该站全部来源链节点均有未撤销授权独自覆盖整段展期。</div>')}
+      </div>`).join('');
+  } else {
+    detail = result.eligible
+      ? ''
+      : ((result.failingNodes || []).map((n) => failingNodeCard(n)).join('')
+        || '<div class="small-muted">所有节点均满足授权要求（但可能存在上方全局错误）。</div>');
+  }
 
   const verdictText = mode === 'recheck'
-    ? (result.eligible ? '✓ 复核通过：当前全部来源链节点均合格，可恢复为已发布。'
-                      : '✗ 复核不通过：仍存在不合格节点，包保持需复核状态。')
-    : (result.eligible ? '✓ 核验通过：来源链上每个节点都有未撤销且覆盖整段使用的授权，可以发布。'
-                      : '✗ 核验不通过：存在不合格节点或输入错误，禁止发布。');
+    ? (result.eligible ? (isTour ? '✓ 复核通过：全部站点的全部来源链节点均合格，可恢复为已发布。'
+                                 : '✓ 复核通过：当前全部来源链节点均合格，可恢复为已发布。')
+                      : '✗ 复核不通过：仍存在不合格站点/节点，包保持需复核状态。')
+    : (result.eligible
+      ? (isTour ? '✓ 核验通过：每个站点沿全部来源链的每个节点，都有一份未撤销授权独自覆盖该站整段展期，可以发布。'
+                : '✓ 核验通过：来源链上每个节点都有未撤销且覆盖整段使用的授权，可以发布。')
+      : (isTour ? '✗ 核验不通过：存在不合格站点（问题按站列出）或行程错误，整包禁止发布。'
+                : '✗ 核验不通过：存在不合格节点或输入错误，禁止发布。'));
+
+  const scopeText = isTour
+    ? `入展品 ${result.stats.rootCount} 个 · 来源链节点 ${result.stats.nodeCount} 个 · 站次 ${result.stats.stopCount} · 失格站 ${result.stats.failingStopCount} · 问题节点 ${result.stats.failingCount}`
+    : `入展品 ${result.stats.rootCount} 个 · 来源链节点 ${result.stats.nodeCount} 个 · 不合格 ${result.stats.failingCount} 个`;
 
   const actionArea = mode === 'publish' && result.eligible && formData.packageId ? `
       <div class="pkg-actions">
-        <button class="btn btn-primary" id="publishBtn">按此次核验结果原子发布</button>
-        <span class="small-muted">发布将再次按当前数据重算并校验依据版本；若期间授权被修改会被拒绝。</span>
+        <button class="btn btn-primary" id="publishBtn">按此次核验结果原子发布${isTour ? '（冻结各站结果与清单）' : ''}</button>
+        <span class="small-muted">发布将在同一事务内重读行程、清单与授权依据并重算；任一站失败则整包不发布。</span>
       </div>`
     : (mode === 'publish' && result.eligible ? '<div class="small-muted">请先「保存待发布包」，再执行发布。</div>' : '');
 
   panel.innerHTML = `
     <div class="verdict ${result.eligible ? 'pass' : 'fail'}">
       ${verdictText}
-      <span class="sub">入展品 ${result.stats.rootCount} 个 · 来源链节点 ${result.stats.nodeCount} 个 · 不合格 ${result.stats.failingCount} 个 · 核验依据版本 ${result.basisVersion}</span>
+      <span class="sub">${scopeText} · 核验依据版本 ${result.basisVersion}</span>
     </div>
     ${globalErrs}${itemErrs}
-    ${result.eligible ? '' : (fail || '<div class="small-muted">所有节点均满足授权要求（但可能存在上方全局错误）。</div>')}
+    ${detail}
     ${actionArea}`;
 
   if (mode === 'publish' && result.eligible) {
@@ -432,6 +545,10 @@ $('#scheduleFormBtn').addEventListener('click', async () => {
   const b = readPkgForm();
   if (!b.packageId) {
     toast('请先「保存待发布包」，再搜索档期（档期搜索只针对已保存的待发布包）', true);
+    return;
+  }
+  if (b.isTour) {
+    toast('多站巡展包不支持档期搜索：档期搜索仅适用于单站包；请直接逐站编辑起止日期（站间不得重叠）。', true);
     return;
   }
   await openScheduleSearch(b.packageId);
@@ -569,16 +686,33 @@ const STATUS_TEXT = { draft: '待发布', published: '已发布', needs_review: 
 function renderPackages() {
   const box = $('#packagesList');
   if (!state.packages.length) { box.innerHTML = '<div class="small-muted">还没有展览包。</div>'; return; }
-  box.innerHTML = state.packages.map((p) => `
+  box.innerHTML = state.packages.map((p) => {
+    const isTour = p.kind === 'tour' || (p.stops || []).length > 0;
+    const scopeMeta = isTour
+      ? `多站巡展 · ${p.stopCount} 站 · 整段 ${p.effectiveFrom} → ${p.effectiveTo} ｜ 素材 ${p.itemCount} 项`
+      : `媒介：${esc(p.medium)} ｜ 地区：${esc(p.region)} ｜ 使用期：${p.useFrom} → ${p.useTo} ｜ 素材 ${p.itemCount} 项`;
+    const stopsBlock = isTour ? `
+      <div class="stops-summary">
+        ${p.stops.map((s) => `
+          <span class="chip">第 ${s.position} 站 · ${esc(s.name)}
+            <span class="small-muted">${esc(s.medium)} ｜ ${esc(s.region)} ｜ ${s.useFrom} → ${s.useTo}</span>
+          </span>`).join('')}
+      </div>` : '';
+    const itemsBlock = isTour ? '' : `
+      <div class="pkg-meta" style="margin-top:4px">
+        素材：${p.items.map((i) => esc(i.title)).join('、')}
+      </div>`;
+    return `
     <div class="panel" data-id="${p.id}">
       <div class="pkg-head">
         <h3>${esc(p.name)} <span class="small-muted">#${p.id}</span>
+          <span class="pill ${isTour ? 'pill-neutral' : 'pill-neutral'}">${isTour ? `多站巡展（${p.stopCount} 站）` : '单站'}</span>
           <span class="pill ${p.status === 'published' ? 'pill-ok' : p.status === 'needs_review' ? 'pill-bad' : 'pill-neutral'}">${STATUS_TEXT[p.status]}</span>
         </h3>
         <div class="pkg-actions">
           ${p.status === 'draft' ? `<button class="btn btn-small" data-act="edit">编辑</button>` : ''}
           ${p.status === 'draft' ? `<button class="btn btn-small btn-primary" data-act="to-verify">去核验</button>` : ''}
-          ${p.status === 'draft' ? `<button class="btn btn-small" data-act="schedule">档期搜索</button>` : ''}
+          ${p.status === 'draft' && !isTour ? `<button class="btn btn-small" data-act="schedule">档期搜索</button>` : ''}
           ${p.status === 'needs_review' ? `<button class="btn btn-small btn-primary" data-act="recheck">重新核验（人工复核）</button>` : ''}
           <button class="btn btn-small" data-act="snapshot">查看最新快照</button>
           <button class="btn btn-small" data-act="copy">复制为待发布包</button>
@@ -586,19 +720,18 @@ function renderPackages() {
         </div>
       </div>
       <div class="pkg-meta">
-        媒介：${esc(p.medium)} ｜ 地区：${esc(p.region)} ｜ 使用期：${p.useFrom} → ${p.useTo}
-        ｜ 素材 ${p.itemCount} 项
+        ${scopeMeta}
         ${p.publishedAt ? `｜ 发布于 ${p.publishedAt.slice(0, 19).replace('T', ' ')}` : ''}
       </div>
-      <div class="pkg-meta" style="margin-top:4px">
-        素材：${p.items.map((i) => esc(i.title)).join('、')}
-      </div>
+      ${isTour ? `<div class="pkg-meta" style="margin-top:4px">整包共享素材：${p.items.map((i) => esc(i.title)).join('、')}</div>` : itemsBlock}
+      ${stopsBlock}
       ${p.latestSnapshot ? `<div class="small-muted" style="margin-top:4px">
         最新快照 #${p.latestSnapshot.id}（${{ publish: '发布', review: '自动复核', recheck: '人工复核' }[p.latestSnapshot.kind]}，
         依据版本 ${p.latestSnapshot.basisVersion}，${p.latestSnapshot.eligible ? '当时合格' : '当时不合格'}，
         ${p.latestSnapshot.createdAt.slice(0, 19).replace('T', ' ')}）— 发布快照 ${p.publishSnapshotId ? `#${p.publishSnapshotId}` : '无'} 始终保留
       </div>` : ''}
-    </div>`).join('');
+    </div>`;
+  }).join('');
 }
 
 $('#packagesList').addEventListener('click', async (e) => {
@@ -648,22 +781,34 @@ async function openSnapshot(snapshotId) {
     $('#modalFoot').classList.add('hidden');
     $('#modalFoot').innerHTML = '';
     const p = s.payload;
+    const isTour = p.kind === 'tour';
+    const reqHead = isTour
+      ? `多站巡展 · 站次 ${p.request.stops.length} · 入展品 ID：${p.request.materialIds.join(', ') || '空'}`
+      : `媒介 ${esc(p.request.medium)} ｜ 地区 ${esc(p.request.region)} ｜ 使用期 ${p.request.useFrom} → ${p.request.useTo}`;
+    const nodeRow = (n) => `
+      <tr>
+        <td>${esc(n.title)}${n.isRoot ? ' <span class="small-muted">（入展品）</span>' : ''}</td>
+        <td>${n.eligible ? '<span class="pill pill-ok">合格</span>' : n.reasonText.map((t) => `<span class="pill pill-bad">${esc(t)}</span>`).join(' ')}</td>
+        <td>${n.matchedAuthorization ? `#${n.matchedAuthorization.id}（${esc(n.matchedAuthorization.media)}/${esc(n.matchedAuthorization.region)}，${n.matchedAuthorization.validFrom}→${n.matchedAuthorization.validTo}）` : '<span class="small-muted">—</span>'}</td>
+        <td>${n.paths.length}</td>
+      </tr>`;
+    const frozenTable = isTour
+      ? p.stops.map((st) => `
+        <div class="stop-result ${st.valid ? 'stop-ok' : 'stop-bad'}">
+          <h4>第 ${st.position} 站 · ${esc(st.name)}
+            <span class="small-muted">${esc(st.medium)} ｜ ${esc(st.region)} ｜ ${st.useFrom} → ${st.useTo}</span>
+            <span class="pill ${st.valid ? 'pill-ok' : 'pill-bad'}">${st.valid ? '合格' : '不合格'}</span>
+          </h4>
+          <table class="auth"><tr><th>节点</th><th>结论</th><th>命中授权</th><th>路径数</th></tr>${st.nodes.map(nodeRow).join('')}</table>
+        </div>`).join('')
+      : `<table class="auth"><tr><th>节点</th><th>结论</th><th>命中授权</th><th>路径数</th></tr>${p.nodes.map(nodeRow).join('')}</table>`;
     $('#modalBody').innerHTML = `
       <div class="verdict ${s.eligible ? 'pass' : 'fail'}">
-        ${s.eligible ? '该快照记录的核验结果：合格' : '该快照记录的核验结果：不合格'}
-        <span class="sub">生成于 ${s.createdAt} ｜ 依据版本 ${s.basisVersion} ｜ 媒介 ${esc(p.request.medium)} ｜ 地区 ${esc(p.request.region)} ｜ 使用期 ${p.request.useFrom} → ${p.request.useTo}</span>
+        ${s.eligible ? '该快照记录的核验结果：合格' : '该快照记录的核验结果：不合格'}${isTour ? '（多站巡展：须全站合格）' : ''}
+        <span class="sub">生成于 ${s.createdAt} ｜ 依据版本 ${s.basisVersion} ｜ ${reqHead}</span>
       </div>
-      <div class="section-title">冻结素材清单（入展品 ID：${p.request.materialIds.join(', ') || '空'}）</div>
-      <table class="auth">
-        <tr><th>节点</th><th>结论</th><th>命中授权</th><th>路径数</th></tr>
-        ${p.nodes.map((n) => `
-          <tr>
-            <td>${esc(n.title)}${n.isRoot ? ' <span class="small-muted">（入展品）</span>' : ''}</td>
-            <td>${n.eligible ? '<span class="pill pill-ok">合格</span>' : n.reasonText.map((t) => `<span class="pill pill-bad">${esc(t)}</span>`).join(' ')}</td>
-            <td>${n.matchedAuthorization ? `#${n.matchedAuthorization.id}（${esc(n.matchedAuthorization.media)}/${esc(n.matchedAuthorization.region)}，${n.matchedAuthorization.validFrom}→${n.matchedAuthorization.validTo}）` : '<span class="small-muted">—</span>'}</td>
-            <td>${n.paths.length}</td>
-          </tr>`).join('')}
-      </table>
+      <div class="section-title">冻结${isTour ? '整包素材清单（各站共享）' : '素材清单'}（入展品 ID：${p.request.materialIds.join(', ') || '空'}）</div>
+      ${frozenTable}
       <div class="section-title">快照原始 JSON</div>
       <pre class="json">${esc(JSON.stringify(p, null, 2))}</pre>`;
     $('#modalBackdrop').classList.remove('hidden');
@@ -699,14 +844,21 @@ function impactListHtml(impact) {
   }
   return `<div class="verdict fail" style="margin-top:8px">
       ✗ 以下 ${impact.length} 个已发布展览包将由合格转为不合格（确认后标记为需复核并追加不可变复核快照，不自动恢复）
-    </div>` + impact.map((p) => `
+    </div>` + impact.map((p) => {
+      const isTour = p.kind === 'tour';
+      const scope = isTour
+        ? `<div class="small-muted">多站巡展 · 失格站点：${(p.failingStops || []).map((s) => `第${s.position}站·${esc(s.name)}`).join('、') || '—'}</div>`
+        : `<div class="small-muted">媒介：${esc(p.medium)} ｜ 地区：${esc(p.region)} ｜ 使用期：${p.useFrom} → ${p.useTo}</div>`;
+      return `
     <div class="impact-pkg">
       <h4>${esc(p.packageName)} <span class="small-muted">#${p.packageId}</span>
+        <span class="pill pill-neutral">${isTour ? `多站巡展` : '单站'}</span>
         <span class="pill pill-ok">当前：已发布</span> → <span class="pill pill-bad">确认后：需复核</span></h4>
-      <div class="small-muted">媒介：${esc(p.medium)} ｜ 地区：${esc(p.region)} ｜ 使用期：${p.useFrom} → ${p.useTo}</div>
-      <div class="section-title">问题节点（${p.failingNodes.length} 个）及原因</div>
+      ${scope}
+      <div class="section-title">问题节点（${p.failingNodes.length} 个）及原因${isTour ? '（按站列出，含全部来源路径）' : ''}</div>
       ${p.failingNodes.map(impactNodesHtml).join('')}
-    </div>`).join('');
+    </div>`;
+    }).join('');
 }
 
 // 发起预演并打开弹层（sourceForm 为发起预演的表单，成功提交后用于复位）
